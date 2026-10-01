@@ -220,12 +220,12 @@ mod tests {
         let url = build_auth_url(
             OAuthProvider::Dropbox,
             "client&other=value",
-            "com.quies:/callback?source=app&next=1",
+            "com.fuin:/callback?source=app&next=1",
             &pkce,
             "state&other=value",
         );
         assert!(url.contains("client_id=client%26other%3Dvalue"));
-        assert!(url.contains("redirect_uri=com.quies%3A%2Fcallback%3Fsource%3Dapp%26next%3D1"));
+        assert!(url.contains("redirect_uri=com.fuin%3A%2Fcallback%3Fsource%3Dapp%26next%3D1"));
         assert!(url.contains("code_challenge=challenge%2Bpart"));
         assert!(url.contains("state=state%26other%3Dvalue"));
 
@@ -233,11 +233,11 @@ mod tests {
             "https://provider.example/token",
             "client&other=value",
             "code&other=value",
-            "com.quies:/callback?source=app&next=1",
+            "com.fuin:/callback?source=app&next=1",
             &pkce.code_verifier,
         );
         let body = String::from_utf8(request.body).unwrap();
-        assert_eq!(body, "grant_type=authorization_code&client_id=client%26other%3Dvalue&code=code%26other%3Dvalue&redirect_uri=com.quies%3A%2Fcallback%3Fsource%3Dapp%26next%3D1&code_verifier=verifier%26part");
+        assert_eq!(body, "grant_type=authorization_code&client_id=client%26other%3Dvalue&code=code%26other%3Dvalue&redirect_uri=com.fuin%3A%2Fcallback%3Fsource%3Dapp%26next%3D1&code_verifier=verifier%26part");
     }
 
     #[test]

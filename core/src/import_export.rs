@@ -1,6 +1,6 @@
 /// Vault import / export support.
 ///
-/// This module converts between the `quies-core` [`Entry`] model and
+/// This module converts between the `fuin-core` [`Entry`] model and
 /// well-known password-manager interchange formats.  **No networking** is
 /// performed here — callers supply raw bytes and receive structured data (or
 /// vice-versa).
@@ -63,7 +63,7 @@ struct BwExport {
 /// Written by `export_bitwarden_json`, consumed (and stripped back out of
 /// `custom_fields`) by `import_bitwarden_json`. Any Bitwarden-side client
 /// just sees an ordinary custom field and ignores it.
-const CATEGORY_OVERRIDE_FIELD: &str = "_quies_original_category";
+const CATEGORY_OVERRIDE_FIELD: &str = "_fuin_original_category";
 
 /// Parse a Bitwarden JSON export (unencrypted vault export from
 /// bitwarden.com → Tools → Export).
@@ -205,8 +205,8 @@ pub fn import_csv(csv_bytes: &[u8]) -> Result<Vec<Entry>, CoreError> {
     let mut entries = Vec::new();
     let now = crate::now_unix();
 
-    let mut lines = text.lines();
-    let header = lines
+    let mut records = csv_records(text).into_iter();
+    let header = records
         .next()
         .ok_or_else(|| CoreError::InvalidFormat("CSV has no header row".into()))?;
 
@@ -219,16 +219,19 @@ pub fn import_csv(csv_bytes: &[u8]) -> Result<Vec<Entry>, CoreError> {
     let url_idx = col_idx("url").or_else(|| col_idx("website"));
     let notes_idx = col_idx("notes").or_else(|| col_idx("note"));
 
-    for line in lines {
-        if line.trim().is_empty() {
+    for record in records {
+        if record.trim().is_empty() {
             continue;
         }
-        let fields = split_csv_row(line);
+        let fields = split_csv_row(record);
         // split_csv_row already stripped quotes and un-escaped `""`, so the
         // field is the real value already — no further trimming needed (and
         // trimming here was the bug: see split_csv_row's doc comment).
+        // strip_formula_escape undoes csv_field's spreadsheet-injection guard.
         let get = |idx: Option<usize>| -> String {
-            idx.and_then(|i| fields.get(i)).cloned().unwrap_or_default()
+            idx.and_then(|i| fields.get(i))
+                .map(|v| strip_formula_escape(v))
+                .unwrap_or_default()
         };
 
         entries.push(Entry {
@@ -289,9 +292,9 @@ pub fn import_1password_csv(csv_bytes: &[u8]) -> Result<Vec<Entry>, CoreError> {
 
     let now = crate::now_unix();
     let mut entries = Vec::new();
-    let mut lines = text.lines();
+    let mut records = csv_records(text).into_iter();
 
-    let header = lines
+    let header = records
         .next()
         .ok_or_else(|| CoreError::InvalidFormat("1Password CSV has no header row".into()))?;
     let cols: Vec<String> = split_csv_row(header);
@@ -304,16 +307,19 @@ pub fn import_1password_csv(csv_bytes: &[u8]) -> Result<Vec<Entry>, CoreError> {
     let notes_idx = col_idx("notes");
     let totp_idx = col_idx("otpauth").or_else(|| col_idx("one-time password"));
 
-    for line in lines {
-        if line.trim().is_empty() {
+    for record in records {
+        if record.trim().is_empty() {
             continue;
         }
-        let fields = split_csv_row(line);
+        let fields = split_csv_row(record);
         // split_csv_row already stripped quotes and un-escaped `""`, so the
         // field is the real value already — no further trimming needed (and
         // trimming here was the bug: see split_csv_row's doc comment).
+        // strip_formula_escape undoes csv_field's spreadsheet-injection guard.
         let get = |idx: Option<usize>| -> String {
-            idx.and_then(|i| fields.get(i)).cloned().unwrap_or_default()
+            idx.and_then(|i| fields.get(i))
+                .map(|v| strip_formula_escape(v))
+                .unwrap_or_default()
         };
 
         let totp_raw = get(totp_idx);
@@ -398,9 +404,9 @@ pub fn import_protonpass_csv(csv_bytes: &[u8]) -> Result<Vec<Entry>, CoreError> 
 
     let now = crate::now_unix();
     let mut entries = Vec::new();
-    let mut lines = text.lines();
+    let mut records = csv_records(text).into_iter();
 
-    let header = lines
+    let header = records
         .next()
         .ok_or_else(|| CoreError::InvalidFormat("Proton Pass CSV has no header row".into()))?;
     let cols: Vec<String> = split_csv_row(header);
@@ -413,16 +419,19 @@ pub fn import_protonpass_csv(csv_bytes: &[u8]) -> Result<Vec<Entry>, CoreError> 
     let note_idx = col_idx("note").or_else(|| col_idx("notes"));
     let totp_idx = col_idx("totp");
 
-    for line in lines {
-        if line.trim().is_empty() {
+    for record in records {
+        if record.trim().is_empty() {
             continue;
         }
-        let fields = split_csv_row(line);
+        let fields = split_csv_row(record);
         // split_csv_row already stripped quotes and un-escaped `""`, so the
         // field is the real value already — no further trimming needed (and
         // trimming here was the bug: see split_csv_row's doc comment).
+        // strip_formula_escape undoes csv_field's spreadsheet-injection guard.
         let get = |idx: Option<usize>| -> String {
-            idx.and_then(|i| fields.get(i)).cloned().unwrap_or_default()
+            idx.and_then(|i| fields.get(i))
+                .map(|v| strip_formula_escape(v))
+                .unwrap_or_default()
         };
 
         let totp_raw = get(totp_idx);
@@ -512,12 +521,109 @@ fn new_id() -> Result<String, CoreError> {
     ))
 }
 
+/// Leading characters that make a spreadsheet evaluate a cell as a formula
+/// instead of showing it as text. Quoting does *not* help here: a quoted
+/// `"=1+1"` is still evaluated by Excel, Sheets, and Numbers, so the only
+/// mitigation is to change the leading byte of the value.
+const FORMULA_TRIGGERS: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
+
+/// Prefix written in front of a formula-triggering field by [`csv_field`].
+const FORMULA_ESCAPE: char = '\'';
+
+/// True if `value` would be executed as a formula when the exported file is
+/// opened in a spreadsheet.
+fn starts_formula(value: &str) -> bool {
+    value.starts_with(|c| FORMULA_TRIGGERS.contains(&c))
+}
+
+/// Undoes the [`FORMULA_ESCAPE`] prefix added by [`csv_field`].
+///
+/// Only strips a leading `'` when the character right after it is itself a
+/// formula trigger, so an ordinary value that happens to start with an
+/// apostrophe (a French quote, say) survives a round-trip untouched.
+fn strip_formula_escape(value: &str) -> String {
+    match value.strip_prefix(FORMULA_ESCAPE) {
+        Some(rest) if starts_formula(rest) => rest.to_string(),
+        _ => value.to_string(),
+    }
+}
+
+/// Renders one field for CSV output.
+///
+/// Quotes when the value contains a delimiter, a quote, or **either** newline
+/// convention — a lone `\r` must be quoted too, otherwise `csv_records` treats
+/// it as a record terminator and silently truncates the value on re-import.
+/// (`\r\n` was already covered by the `\n` check; the bare-`\r` case was not.)
+///
+/// A value that would be executed as a spreadsheet formula is prefixed with
+/// [`FORMULA_ESCAPE`] so it round-trips as literal text. `strip_formula_escape`
+/// removes that prefix on import.
 fn csv_field(value: &str) -> String {
-    if value.contains(',') || value.contains('"') || value.contains('\n') {
-        format!("\"{}\"", value.replace('"', "\"\""))
+    let needs_quotes = value.contains(',')
+        || value.contains('"')
+        || value.contains('\n')
+        || value.contains('\r');
+
+    let escaped = if starts_formula(value) {
+        format!("{FORMULA_ESCAPE}{value}")
     } else {
         value.to_string()
+    };
+
+    if needs_quotes {
+        format!("\"{}\"", escaped.replace('"', "\"\""))
+    } else {
+        escaped
     }
+}
+
+/// Splits CSV text into logical records, honoring RFC 4180 quoting: a newline
+/// only terminates a record when it is *outside* a quoted field. A field like
+/// `"line one\nline two"` therefore stays a single record instead of splitting
+/// into two, which is what `str::lines()` did before (it cuts on every raw
+/// newline, producing a phantom extra entry for every embedded line break —
+/// including the ones Fuin's own `export_*_csv` functions write).
+///
+/// The returned records keep their embedded newlines verbatim; `split_csv_row`
+/// strips the surrounding quotes and un-escapes doubled `""` afterwards.
+fn csv_records(text: &str) -> Vec<&str> {
+    let mut records = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let bytes = text.as_bytes();
+
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                // Inside a quoted field, `""` is a literal quote and must not
+                // toggle quoting state. Mirrors split_csv_row's handling so
+                // the two passes agree on where quotes open and close.
+                if in_quotes && bytes.get(i + 1) == Some(&b'"') {
+                    i += 1;
+                } else {
+                    in_quotes = !in_quotes;
+                }
+            }
+            b'\r' | b'\n' if !in_quotes => {
+                records.push(&text[start..i]);
+                // Treat CRLF as a single terminator rather than two, so
+                // Windows-origin exports (common from 1Password / Proton
+                // Pass on Windows) don't yield an empty record between
+                // every row.
+                if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                    i += 1;
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if start < bytes.len() {
+        records.push(&text[start..]);
+    }
+    records
 }
 
 /// RFC 4180 field splitter. Unlike a naive quote-toggling splitter, this
@@ -527,7 +633,7 @@ fn csv_field(value: &str) -> String {
 /// afterwards was the bug: it strips quote characters from both ends of the
 /// raw token irrespective of how many of them were content vs. delimiters,
 /// corrupting any field with an embedded escaped quote, e.g. `"Say ""Hi"""`
-/// coming back as `Say ""Hi` instead of `Say "Hi"`).
+/// coming back as `Say "Hi"`).
 fn split_csv_row(line: &str) -> Vec<String> {
     let mut fields = Vec::new();
     let mut field = String::new();
@@ -902,5 +1008,372 @@ mod tests {
         let text_pp = String::from_utf8(exported_pp).unwrap();
         assert!(text_pp.contains("Keep"));
         assert!(!text_pp.contains("Deleted"));
+    }
+
+    // ---- Multi-line (RFC 4180 quoted) CSV fields --------------------------
+    //
+    // All three CSV importers used to split records with `str::lines()`,
+    // which cuts on every raw newline and ignores quoting entirely. A field
+    // with an embedded line break — a multi-line note, a pasted passphrase —
+    // therefore split into extra records, each importing as its own entry
+    // with the continuation line's text landing in the first column. This
+    // also broke Fuin's own export → import round-trip, since every
+    // `export_*_csv` below legitimately writes quoted multi-line fields.
+
+    #[test]
+    fn csv_records_keeps_quoted_newlines_inside_one_record() {
+        let records = csv_records("a,\"line one\nline two\"\nc\n");
+        assert_eq!(records, vec!["a,\"line one\nline two\"", "c"]);
+    }
+
+    #[test]
+    fn csv_records_does_not_toggle_quotes_on_escaped_pairs() {
+        // `""` inside a quoted field is a literal quote, not a close+reopen,
+        // so the newline after it is still inside the quoted field.
+        let records = csv_records("a,\"say \"\"hi\"\"\nthere\"\nb\n");
+        assert_eq!(records, vec!["a,\"say \"\"hi\"\"\nthere\"", "b"]);
+    }
+
+    #[test]
+    fn csv_records_handles_crlf_and_missing_trailing_newline() {
+        assert_eq!(csv_records("a,b\r\nc,d\r\n"), vec!["a,b", "c,d"]);
+        assert_eq!(csv_records("a,b"), vec!["a,b"]);
+        assert_eq!(csv_records(""), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn generic_csv_import_keeps_multiline_note_as_single_entry() {
+        let csv = "title,username,password,url,notes\n\
+                   Bank,me,pw,bank.com,\"first line\nsecond line\"\n\
+                   Email,me,pw,mail.com,single\n";
+        let entries = import_csv(csv.as_bytes()).unwrap();
+
+        assert_eq!(entries.len(), 2, "multi-line note must not create a phantom entry");
+        assert_eq!(entries[0].title, "Bank");
+        assert_eq!(entries[0].username, "me");
+        assert_eq!(entries[0].notes, "first line\nsecond line");
+        assert_eq!(entries[1].title, "Email");
+        assert_eq!(entries[1].notes, "single");
+    }
+
+    #[test]
+    fn onepassword_csv_import_keeps_multiline_note_as_single_entry() {
+        let csv = "Title,Username,Password,URL,OTPAuth,Notes\n\
+                   Bank,me,pw,bank.com,,\"first line\nsecond line\"\n\
+                   Email,me,pw,mail.com,,single\n";
+        let entries = import_1password_csv(csv.as_bytes()).unwrap();
+
+        assert_eq!(entries.len(), 2, "multi-line note must not create a phantom entry");
+        assert_eq!(entries[0].title, "Bank");
+        assert_eq!(entries[0].notes, "first line\nsecond line");
+        assert_eq!(entries[1].title, "Email");
+    }
+
+    #[test]
+    fn protonpass_csv_import_keeps_multiline_note_as_single_entry() {
+        let csv = "name,url,email,password,note,totp\n\
+                   Bank,bank.com,me,pw,\"first line\nsecond line\",\n\
+                   Email,mail.com,me,pw,single,\n";
+        let entries = import_protonpass_csv(csv.as_bytes()).unwrap();
+
+        assert_eq!(entries.len(), 2, "multi-line note must not create a phantom entry");
+        assert_eq!(entries[0].title, "Bank");
+        assert_eq!(entries[0].notes, "first line\nsecond line");
+        assert_eq!(entries[1].title, "Email");
+    }
+
+    #[test]
+    fn generic_csv_export_import_roundtrip_preserves_multiline_notes() {
+        let entries = vec![Entry {
+            id: "e1".into(),
+            title: "Multi".into(),
+            username: "u".into(),
+            password: "p".into(),
+            url: "https://x.com".into(),
+            notes: "line one\nline two".into(),
+            totp_secret: None,
+            custom_fields: HashMap::new(),
+            updated_at: 1,
+            deleted: false,
+            tags: vec![],
+            collection_id: None,
+            favorite: false,
+            alias_provider: None,
+            alias_id: None,
+            alias_email: None,
+            category: ItemCategory::Login,
+            password_history: vec![],
+            attachments: vec![],
+        }];
+
+        let exported = export_csv(&entries);
+        let reimported = import_csv(&exported).unwrap();
+
+        assert_eq!(reimported.len(), 1);
+        assert_eq!(reimported[0].notes, "line one\nline two");
+        assert_eq!(reimported[0].title, "Multi");
+    }
+
+    #[test]
+    fn onepassword_and_protonpass_roundtrips_preserve_multiline_notes() {
+        let entries = vec![Entry {
+            id: "e1".into(),
+            title: "Multi".into(),
+            username: "u".into(),
+            password: "p".into(),
+            url: "https://x.com".into(),
+            notes: "line one\nline two".into(),
+            totp_secret: Some("JBSWY3DPEHPK3PXP".into()),
+            custom_fields: HashMap::new(),
+            updated_at: 1,
+            deleted: false,
+            tags: vec![],
+            collection_id: None,
+            favorite: false,
+            alias_provider: None,
+            alias_id: None,
+            alias_email: None,
+            category: ItemCategory::Login,
+            password_history: vec![],
+            attachments: vec![],
+        }];
+
+        let reimported_1p = import_1password_csv(&export_1password_csv(&entries)).unwrap();
+        assert_eq!(reimported_1p.len(), 1);
+        assert_eq!(reimported_1p[0].notes, "line one\nline two");
+
+        let reimported_pp = import_protonpass_csv(&export_protonpass_csv(&entries)).unwrap();
+        assert_eq!(reimported_pp.len(), 1);
+        assert_eq!(reimported_pp[0].notes, "line one\nline two");
+    }
+
+    #[test]
+    fn csv_import_multiline_title_stays_in_title_column() {
+        // Guards the specific column-alignment failure mode: previously the
+        // continuation line was parsed as its own row, so the text after the
+        // newline landed in `title` rather than the notes field it came from.
+        let csv = "title,username,password,url,notes\n\
+                   \"Acme Corp\nHoldings\",u,p,,unrelated\n";
+        let entries = import_csv(csv.as_bytes()).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "Acme Corp\nHoldings");
+        assert_eq!(entries[0].notes, "unrelated");
+    }
+
+    // ---- Lone carriage returns --------------------------------------------
+    //
+    // csv_field used to quote on ',', '"' and '\n' but not '\r'. A field with
+    // a lone CR was therefore written unquoted, and csv_records — correctly,
+    // per RFC 4180 — treated that CR as a record terminator. The value was
+    // silently truncated at the CR and a phantom entry appeared.
+
+    #[test]
+    fn csv_field_quotes_lone_carriage_return() {
+        assert_eq!(csv_field("a\rb"), "\"a\rb\"");
+        // \n and \r\n were already quoted; make sure that still holds.
+        assert_eq!(csv_field("a\nb"), "\"a\nb\"");
+        assert_eq!(csv_field("a\r\nb"), "\"a\r\nb\"");
+        // Plain values stay unquoted.
+        assert_eq!(csv_field("plain"), "plain");
+    }
+
+    #[test]
+    fn csv_roundtrip_preserves_lone_carriage_return() {
+        for raw in ["a\rb", "a\nb", "a\r\nb", "\rleading", "trailing\r"] {
+            let entries = vec![Entry {
+                id: "e1".into(),
+                title: raw.into(),
+                username: "u".into(),
+                password: "p".into(),
+                url: "".into(),
+                notes: raw.into(),
+                totp_secret: None,
+                custom_fields: HashMap::new(),
+                updated_at: 1,
+                deleted: false,
+                tags: vec![],
+                collection_id: None,
+                favorite: false,
+                alias_provider: None,
+                alias_id: None,
+                alias_email: None,
+                category: ItemCategory::Login,
+                password_history: vec![],
+                attachments: vec![],
+            }];
+
+            let back = import_csv(&export_csv(&entries)).unwrap();
+            assert_eq!(back.len(), 1, "lone CR split {raw:?} into extra entries");
+            assert_eq!(back[0].title, raw, "title mangled for {raw:?}");
+            assert_eq!(back[0].notes, raw, "notes mangled for {raw:?}");
+        }
+    }
+
+    #[test]
+    fn onepassword_and_protonpass_roundtrip_preserve_lone_carriage_return() {
+        let entries = vec![Entry {
+            id: "e1".into(),
+            title: "a\rb".into(),
+            username: "u".into(),
+            password: "p".into(),
+            url: "https://x.com".into(),
+            notes: "a\rb".into(),
+            totp_secret: Some("JBSWY3DPEHPK3PXP".into()),
+            custom_fields: HashMap::new(),
+            updated_at: 1,
+            deleted: false,
+            tags: vec![],
+            collection_id: None,
+            favorite: false,
+            alias_provider: None,
+            alias_id: None,
+            alias_email: None,
+            category: ItemCategory::Login,
+            password_history: vec![],
+            attachments: vec![],
+        }];
+
+        let back_1p = import_1password_csv(&export_1password_csv(&entries)).unwrap();
+        assert_eq!(back_1p.len(), 1);
+        assert_eq!(back_1p[0].title, "a\rb");
+        assert_eq!(back_1p[0].notes, "a\rb");
+
+        let back_pp = import_protonpass_csv(&export_protonpass_csv(&entries)).unwrap();
+        assert_eq!(back_pp.len(), 1);
+        assert_eq!(back_pp[0].title, "a\rb");
+        assert_eq!(back_pp[0].notes, "a\rb");
+    }
+
+    // ---- Spreadsheet formula injection ------------------------------------
+
+    #[test]
+    fn csv_field_neutralizes_formula_triggers() {
+        // Quoting alone does not stop a spreadsheet evaluating a cell, so the
+        // value's leading byte has to change.
+        assert_eq!(csv_field("=1+1"), "'=1+1");
+        assert_eq!(csv_field("+cmd"), "'+cmd");
+        assert_eq!(csv_field("-2+3"), "'-2+3");
+        assert_eq!(csv_field("@SUM(A1)"), "'@SUM(A1)");
+        assert_eq!(csv_field("\t=evil"), "'\t=evil");
+        assert_eq!(csv_field("\r=evil"), "\"'\r=evil\"");
+        // Not triggers — left alone.
+        assert_eq!(csv_field("normal"), "normal");
+        assert_eq!(csv_field("1+1"), "1+1");
+    }
+
+    #[test]
+    fn strip_formula_escape_only_removes_real_escapes() {
+        // A genuine export escape is undone...
+        assert_eq!(strip_formula_escape("'=1+1"), "=1+1");
+        assert_eq!(strip_formula_escape("'+cmd"), "+cmd");
+        assert_eq!(strip_formula_escape("'@x"), "@x");
+        // ...but an apostrophe that isn't an escape is left alone.
+        assert_eq!(strip_formula_escape("'quoted"), "'quoted");
+        assert_eq!(strip_formula_escape("'"), "'");
+        assert_eq!(strip_formula_escape("it's fine"), "it's fine");
+        assert_eq!(strip_formula_escape("plain"), "plain");
+    }
+
+    #[test]
+    fn formula_prefixed_export_roundtrips_to_the_original_value() {
+        for raw in [
+            "=1+1",
+            "+cmd|calc",
+            "-2+3",
+            "@SUM(A1)",
+            "\t=evil",
+            "\r=evil",
+            "'quoted",
+            "normal",
+            "1+1",
+        ] {
+            let entries = vec![Entry {
+                id: "e1".into(),
+                title: raw.into(),
+                username: raw.into(),
+                password: "p".into(),
+                url: "".into(),
+                notes: raw.into(),
+                totp_secret: None,
+                custom_fields: HashMap::new(),
+                updated_at: 1,
+                deleted: false,
+                tags: vec![],
+                collection_id: None,
+                favorite: false,
+                alias_provider: None,
+                alias_id: None,
+                alias_email: None,
+                category: ItemCategory::Login,
+                password_history: vec![],
+                attachments: vec![],
+            }];
+
+            let csv = String::from_utf8(export_csv(&entries)).unwrap();
+            let back = import_csv(csv.as_bytes()).unwrap();
+
+            assert_eq!(back.len(), 1, "{raw:?} split into extra entries");
+            assert_eq!(back[0].title, raw, "title changed for {raw:?}");
+            assert_eq!(back[0].username, raw, "username changed for {raw:?}");
+            assert_eq!(back[0].notes, raw, "notes changed for {raw:?}");
+
+            // The exported text itself must not begin a cell with a live
+            // formula trigger — that's the whole point of the guard.
+            let first_field = csv.lines().nth(1).unwrap();
+            let cell = first_field.split(',').next().unwrap().trim_matches('"');
+            assert!(
+                !starts_formula(cell),
+                "export still begins with a formula trigger: {cell:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn importing_third_party_csv_preserves_leading_equals_signs() {
+        // A CSV produced by another password manager (no Fuin escape prefix)
+        // must import its values verbatim — we only strip a prefix we wrote.
+        let csv = "title,username,password,url,notes\n=cmd,=SUM(A1),p,,plain\n";
+        let entries = import_csv(csv.as_bytes()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "=cmd");
+        assert_eq!(entries[0].username, "=SUM(A1)");
+        assert_eq!(entries[0].notes, "plain");
+    }
+
+    #[test]
+    fn onepassword_and_protonpass_formula_roundtrips() {
+        let entries = vec![Entry {
+            id: "e1".into(),
+            title: "=1+1".into(),
+            username: "@SUM(A1)".into(),
+            password: "p".into(),
+            url: "https://x.com".into(),
+            notes: "+cmd".into(),
+            totp_secret: Some("JBSWY3DPEHPK3PXP".into()),
+            custom_fields: HashMap::new(),
+            updated_at: 1,
+            deleted: false,
+            tags: vec![],
+            collection_id: None,
+            favorite: false,
+            alias_provider: None,
+            alias_id: None,
+            alias_email: None,
+            category: ItemCategory::Login,
+            password_history: vec![],
+            attachments: vec![],
+        }];
+
+        let back_1p = import_1password_csv(&export_1password_csv(&entries)).unwrap();
+        assert_eq!(back_1p.len(), 1);
+        assert_eq!(back_1p[0].title, "=1+1");
+        assert_eq!(back_1p[0].username, "@SUM(A1)");
+        assert_eq!(back_1p[0].notes, "+cmd");
+
+        let back_pp = import_protonpass_csv(&export_protonpass_csv(&entries)).unwrap();
+        assert_eq!(back_pp.len(), 1);
+        assert_eq!(back_pp[0].title, "=1+1");
+        assert_eq!(back_pp[0].notes, "+cmd");
     }
 }

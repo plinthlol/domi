@@ -16,10 +16,8 @@ pub enum FavoriteSort {
 pub fn list_favorites(index: &Index, sort: FavoriteSort) -> Vec<&IndexEntry> {
     let mut favorites: Vec<&IndexEntry> = index.entries.iter().filter(|e| !e.deleted && e.favorite).collect();
     match sort {
-        FavoriteSort::TitleAscending => {
-            favorites.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
-        }
-        FavoriteSort::RecentlyUpdatedFirst => favorites.sort_by(|a, b| b.updated_at.cmp(&a.updated_at)),
+        FavoriteSort::TitleAscending => favorites.sort_by_key(|a| a.title.to_lowercase()),
+        FavoriteSort::RecentlyUpdatedFirst => favorites.sort_by_key(|a| std::cmp::Reverse(a.updated_at)),
     }
     favorites
 }

@@ -169,8 +169,7 @@ mod tests {
         // current while serving stale data. Save at version 1, and confirm
         // the loaded cache reports version 1 regardless of what the
         // in-memory Index has moved on to.
-        let mut index = Index::default();
-        index.version = 1;
+        let mut index = Index { version: 1, ..Default::default() };
         index.entries.push(IndexEntry {
             id: "1".into(),
             title: "Old Title".into(),

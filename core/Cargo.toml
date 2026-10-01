@@ -1,12 +1,12 @@
 [package]
-name = "quies-core"
+name = "fuin-core"
 version = "0.1.0"
 edition = "2021"
-description = "Platform-agnostic crypto, vault format, and business logic for Quies."
+description = "Platform-agnostic crypto, vault format, and business logic for Fuin."
 license = "MIT OR Apache-2.0"
 
 [lib]
-name = "quies_core"
+name = "fuin_core"
 path = "src/lib.rs"
 
 [dependencies]

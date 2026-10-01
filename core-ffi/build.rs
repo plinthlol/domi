@@ -1,3 +1,3 @@
 fn main() {
-    uniffi::generate_scaffolding("src/quies.udl").unwrap();
+    uniffi::generate_scaffolding("src/fuin.udl").unwrap();
 }

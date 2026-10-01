@@ -1,14 +1,14 @@
 [package]
-name = "quies-core-wasm"
+name = "fuin-core-wasm"
 version = "0.1.0"
 edition = "2021"
-description = "Thin wasm-bindgen wrapper around quies-core, JSON string boundary."
+description = "Thin wasm-bindgen wrapper around fuin-core, JSON string boundary."
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-quies-core = { path = "../core" }
+fuin-core = { path = "../core" }
 wasm-bindgen = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

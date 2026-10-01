@@ -1,15 +1,15 @@
 [package]
-name = "quies-core-ffi"
+name = "fuin-core-ffi"
 version = "0.1.0"
 edition = "2021"
-description = "UniFFI bindings for quies-core — Swift (iOS) and Kotlin (Android)."
+description = "UniFFI bindings for fuin-core — Swift (iOS) and Kotlin (Android)."
 
 [lib]
 crate-type = ["staticlib", "cdylib", "rlib"]
-name = "quies_core_ffi"
+name = "fuin_core_ffi"
 
 [dependencies]
-quies-core = { path = "../core" }
+fuin-core = { path = "../core" }
 uniffi = "0.28"
 base64 = "0.22"
 sha1 = "0.10"

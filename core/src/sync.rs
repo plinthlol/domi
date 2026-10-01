@@ -42,13 +42,14 @@ impl Mergeable for Collection {
     }
 }
 
+/// Result of one last-write-wins merge: the merged list, ids the local side
+/// won (need uploading), and ids the remote side won (need downloading).
+type MergeListsResult<T> = Result<(Vec<T>, Vec<String>, Vec<String>), CoreError>;
+
 /// Last-write-wins merge of two lists of the same [`Mergeable`] type, keyed by
 /// id. Ties (equal `updated_at`) favor local so re-running a merge with no
 /// remote changes is a no-op with nothing queued to upload.
-fn merge_lists<T: Mergeable>(
-    local: &[T],
-    remote: &[T],
-) -> Result<(Vec<T>, Vec<String>, Vec<String>), CoreError> {
+fn merge_lists<T: Mergeable>(local: &[T], remote: &[T]) -> MergeListsResult<T> {
     let mut merged = Vec::new();
     let mut to_upload = Vec::new();
     let mut to_download = Vec::new();
@@ -176,7 +177,12 @@ pub fn merge(local: &Index, remote: &Index) -> Result<MergeResult, CoreError> {
         merge_lists(&local.collections, &remote.collections)?;
 
     let merged_index = Index {
-        version: local.version.max(remote.version) + 1,
+        // `remote.version` is attacker-controlled (a sync backend can return
+        // anything), so saturate instead of adding: `u64::MAX + 1` overflows
+        // and panics, turning a malicious or corrupt backend into a crash.
+        // The version is only a monotonic marker for cache invalidation, so
+        // pinning it at u64::MAX is harmless and keeps merges ordered.
+        version: local.version.max(remote.version).saturating_add(1),
         entries,
         tags,
         collections,
@@ -442,7 +448,7 @@ mod tests {
 
         pending.dequeue("e1");
         assert!(pending.is_empty());
-        assert!(pending.retry_attempts.get("e1").is_none());
+        assert!(!pending.retry_attempts.contains_key("e1"));
     }
 
     #[test]
@@ -468,5 +474,52 @@ mod tests {
         );
         assert_eq!(report.state, SyncState::Error);
         assert_eq!(report.retry_after_seconds, Some(2));
+    }
+
+    // Regression: `merged_index.version` was `max(local, remote) + 1`, which
+    // overflowed and panicked on a remote index claiming u64::MAX. Since a
+    // sync backend is untrusted, that turned a corrupt/malicious response
+    // into a crash reachable from `merge_indexes` on both FFI and WASM.
+
+    #[test]
+    fn merge_saturates_instead_of_overflowing_at_u64_max() {
+        let local = Index { version: u64::MAX, ..Default::default() };
+        let remote = Index { version: u64::MAX, ..Default::default() };
+
+        let merged = merge(&local, &remote).expect("merge must not overflow");
+        assert_eq!(merged.merged_index.version, u64::MAX, "saturates at u64::MAX");
+    }
+
+    #[test]
+    fn merge_saturates_when_only_remote_is_at_max() {
+        let local = Index { version: 5, ..Default::default() };
+        let remote = Index { version: u64::MAX, ..Default::default() };
+
+        let merged = merge(&local, &remote).unwrap();
+        assert_eq!(merged.merged_index.version, u64::MAX);
+    }
+
+    #[test]
+    fn merge_still_increments_normally() {
+        let local = Index { version: 7, ..Default::default() };
+        let remote = Index { version: 9, ..Default::default() };
+
+        let merged = merge(&local, &remote).unwrap();
+        assert_eq!(merged.merged_index.version, 10, "ordinary case still increments");
+    }
+
+    #[test]
+    fn merge_from_json_with_max_version_does_not_panic() {
+        // Mirrors the real call path: remote JSON arrives from a backend.
+        let local: Index =
+            serde_json::from_str(r#"{"version":1,"entries":[],"tags":[],"collections":[]}"#)
+                .unwrap();
+        let remote: Index = serde_json::from_str(
+            r#"{"version":18446744073709551615,"entries":[],"tags":[],"collections":[]}"#,
+        )
+        .unwrap();
+
+        let merged = merge(&local, &remote).unwrap();
+        assert_eq!(merged.merged_index.version, u64::MAX);
     }
 }

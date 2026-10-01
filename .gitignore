@@ -1,0 +1,17 @@
+# Cargo build output
+/target/
+
+# UniFFI generated bindings (built by core-ffi/build.rs into target/, but
+# explicitly-generated ones may land at the crate root or in a local dir)
+/core-ffi/generated/
+*.kt
+*.swift
+*.py
+
+# wasm-bindgen / wasm-pack output
+/pkg/
+*.wasm
+
+# Editor / OS noise
+.DS_Store
+*.swp

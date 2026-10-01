@@ -34,19 +34,14 @@ pub struct RekeyResult {
     pub entries_enc: HashMap<String, Vec<u8>>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ItemCategory {
+    #[default]
     Login,
     CreditCard,
     SecureNote,
     Identity,
     BankAccount,
-}
-
-impl Default for ItemCategory {
-    fn default() -> Self {
-        Self::Login
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -364,7 +359,10 @@ impl Vault {
         } else {
             index.entries.push(index_item);
         }
-        index.version += 1;
+        // Saturate: `index.version` can arrive near u64::MAX via a crafted or
+        // corrupt index, and `+= 1` would overflow and panic. As in merge(),
+        // the counter only orders cache invalidation, so saturating is safe.
+        index.version = index.version.saturating_add(1);
 
         let entry_json = serde_json::to_vec(&entry)
             .map_err(|e| CoreError::InvalidFormat(format!("failed to serialize entry: {e}")))?;
@@ -666,5 +664,77 @@ mod tests {
         let enc = vault.encrypt_attachment(&attachment, "entry-1").unwrap();
         let dec = vault.decrypt_attachment(&enc, "entry-1", "att-3").unwrap();
         assert_eq!(dec.data, vec![1, 2, 3, 4]);
+    }
+
+    // Regression: put_entry did `index.version += 1`, which overflowed and
+    // panicked when the index already sat at u64::MAX — reachable by
+    // unlocking a crafted or corrupt index and saving one entry.
+
+    #[test]
+    fn put_entry_saturates_index_version_instead_of_overflowing() {
+        let (vault, _manifest, _index_enc) = Vault::create("pass123", test_params()).unwrap();
+        let mut index = Index {
+            version: u64::MAX,
+            ..Default::default()
+        };
+
+        let entry = Entry {
+            id: "e-max".into(),
+            title: "Edge".into(),
+            username: "u".into(),
+            password: "p".into(),
+            url: "".into(),
+            notes: "".into(),
+            totp_secret: None,
+            custom_fields: HashMap::new(),
+            updated_at: 1,
+            deleted: false,
+            tags: vec![],
+            collection_id: None,
+            favorite: false,
+            alias_provider: None,
+            alias_id: None,
+            alias_email: None,
+            category: ItemCategory::default(),
+            password_history: vec![],
+            attachments: vec![],
+        };
+
+        vault.put_entry(&mut index, entry).expect("put_entry must not overflow");
+        assert_eq!(index.version, u64::MAX, "saturates at u64::MAX");
+    }
+
+    #[test]
+    fn put_entry_still_increments_version_normally() {
+        let (vault, _manifest, _index_enc) = Vault::create("pass123", test_params()).unwrap();
+        let mut index = Index {
+            version: 3,
+            ..Default::default()
+        };
+
+        let entry = Entry {
+            id: "e-inc".into(),
+            title: "Inc".into(),
+            username: "u".into(),
+            password: "p".into(),
+            url: "".into(),
+            notes: "".into(),
+            totp_secret: None,
+            custom_fields: HashMap::new(),
+            updated_at: 1,
+            deleted: false,
+            tags: vec![],
+            collection_id: None,
+            favorite: false,
+            alias_provider: None,
+            alias_id: None,
+            alias_email: None,
+            category: ItemCategory::default(),
+            password_history: vec![],
+            attachments: vec![],
+        };
+
+        vault.put_entry(&mut index, entry).unwrap();
+        assert_eq!(index.version, 4, "ordinary case still increments");
     }
 }

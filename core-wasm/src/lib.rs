@@ -1,5 +1,5 @@
 use base64::Engine;
-use quies_core::{
+use fuin_core::{
     assign_tag, check_strength, create_collection, create_tag, delete_collection, delete_tag,
     build_auth_url, build_token_exchange_request, generate_oauth_state,
     generate_password, generate_pkce, generate_totp, list_children,
@@ -73,7 +73,7 @@ fn parse_alias_provider(provider: &str) -> Result<AliasProviderKind, String> {
 // linear memory as a JS-visible value: JS only ever sees an opaque u64
 // handle. This replaces the previous design where wasm_create_vault/
 // wasm_unlock_vault derived the key a second time and returned it as a
-// base64 String — see AUDIT.md §1 / QUIES_AUDIT_FINDINGS.md [HIGH].
+// base64 String — see AUDIT.md §1 / FUIN_AUDIT_FINDINGS.md [HIGH].
 // Call wasm_lock_vault to drop a handle's entry and zeroize its key.
 
 fn vaults() -> &'static Mutex<HashMap<u64, Vault>> {
@@ -410,7 +410,7 @@ pub fn wasm_build_token_exchange_request(token_url: &str, client_id: &str, code:
 #[wasm_bindgen]
 pub fn wasm_parse_token_response(response_b64: &str, current_unix_time: i64) -> String {
     let bytes = match BASE64.decode(response_b64) { Ok(b) => b, Err(e) => return err_json(format!("invalid base64 response: {e}")) };
-    match quies_core::parse_token_response(&bytes, current_unix_time) { Ok(t) => ok_json(t), Err(e) => err_json(e) }
+    match fuin_core::parse_token_response(&bytes, current_unix_time) { Ok(t) => ok_json(t), Err(e) => err_json(e) }
 }
 
 #[wasm_bindgen]
@@ -450,14 +450,14 @@ pub fn wasm_sync_pending_apply(pending_json: &str, operation: &str, id: &str) ->
 }
 
 #[wasm_bindgen]
-pub fn wasm_sync_retry_backoff(attempt: u32) -> u64 { quies_core::retry_backoff_seconds(attempt) }
+pub fn wasm_sync_retry_backoff(attempt: u32) -> u64 { fuin_core::retry_backoff_seconds(attempt) }
 
 #[wasm_bindgen]
 pub fn wasm_sync_resolve_conflict(local_json: &str, remote_json: &str, strategy: &str) -> String {
     let local = match serde_json::from_str(local_json) { Ok(v) => v, Err(e) => return err_json(format!("invalid local entry: {e}")) };
     let remote = match serde_json::from_str(remote_json) { Ok(v) => v, Err(e) => return err_json(format!("invalid remote entry: {e}")) };
     let strategy = match strategy { "local" => ConflictStrategy::KeepLocal, "remote" => ConflictStrategy::KeepRemote, "newest" => ConflictStrategy::KeepNewest, other => return err_json(format!("unknown conflict strategy: {other}")) };
-    ok_json(quies_core::resolve_conflict(&local, &remote, strategy))
+    ok_json(fuin_core::resolve_conflict(&local, &remote, strategy))
 }
 
 // ---------------------------------------------------------------------------
@@ -466,7 +466,7 @@ pub fn wasm_sync_resolve_conflict(local_json: &str, remote_json: &str, strategy:
 
 #[derive(Serialize)]
 struct TagOutput {
-    tag: quies_core::Tag,
+    tag: fuin_core::Tag,
     index: Index,
 }
 
@@ -568,7 +568,7 @@ pub fn wasm_entry_remove_tag(entry_json: &str, tag_id: &str) -> String {
 
 #[derive(Serialize)]
 struct CollectionOutput {
-    collection: quies_core::Collection,
+    collection: fuin_core::Collection,
     index: Index,
 }
 
@@ -845,7 +845,7 @@ pub fn wasm_entry_get_password_history(entry_json: &str) -> String {
         Ok(e) => e,
         Err(e) => return err_json(e),
     };
-    let history = quies_core::get_password_history(&entry);
+    let history = fuin_core::get_password_history(&entry);
     ok_json(history)
 }
 
@@ -855,7 +855,7 @@ pub fn wasm_entry_get_password_history(entry_json: &str) -> String {
 
 #[wasm_bindgen]
 pub fn wasm_vault_encrypt_attachment(handle: u64, attachment_json: &str, entry_id: &str) -> String {
-    let attachment: quies_core::Attachment = match serde_json::from_str(attachment_json) {
+    let attachment: fuin_core::Attachment = match serde_json::from_str(attachment_json) {
         Ok(a) => a,
         Err(e) => return err_json(format!("invalid attachment json: {e}")),
     };
@@ -966,4 +966,334 @@ pub fn wasm_export_protonpass_csv(entries_json: &str) -> String {
         Err(e) => return err_json(format!("invalid entries json: {e}")),
     };
     ok_json(BASE64.encode(export_protonpass_csv(&entries)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    // Every wasm_* function returns a JSON string rather than a Rust Result,
+    // because a thrown JS exception can't cross the wasm-bindgen boundary the
+    // way a typed error can. These tests pin down that envelope: callers must
+    // be able to tell success from failure and read `data` / `error`.
+
+    fn parse(json: &str) -> Value {
+        serde_json::from_str(json)
+            .unwrap_or_else(|e| panic!("wasm fn returned invalid JSON: {json} ({e})"))
+    }
+
+    fn assert_ok(json: &str) -> Value {
+        let v = parse(json);
+        assert_eq!(v["success"], Value::Bool(true), "expected success, got {json}");
+        assert!(v.get("error").is_none(), "success must omit error key: {json}");
+        v
+    }
+
+    fn assert_err(json: &str) -> String {
+        let v = parse(json);
+        assert_eq!(v["success"], Value::Bool(false), "expected failure, got {json}");
+        assert!(v.get("data").is_none(), "failure must omit data key: {json}");
+        v["error"].as_str().expect("error must be a string").to_string()
+    }
+
+    /// Creates a vault and returns (handle, manifest_json, index_enc_b64).
+    fn make_vault() -> (u64, String, String) {
+        let v = assert_ok(&wasm_create_vault("master-pass"));
+        let data = &v["data"];
+        (
+            data["handle"].as_u64().unwrap(),
+            data["manifest"].to_string(),
+            data["index_enc_b64"].as_str().unwrap().to_string(),
+        )
+    }
+
+    /// A minimal valid empty `Index` JSON. `Index.version` has no serde
+    /// default, so callers must supply it — `{}` is rejected as malformed.
+    fn empty_index_json() -> String {
+        serde_json::json!({ "version": 0, "entries": [] }).to_string()
+    }
+
+    /// A fully-populated `Entry` JSON. Several `Entry` fields have no serde
+    /// default (`custom_fields`, `updated_at`, `deleted`), so a partial
+    /// object is rejected as malformed.
+    fn sample_entry_json(id: &str) -> String {
+        serde_json::json!({
+            "id": id,
+            "title": "GitHub",
+            "username": "octocat",
+            "password": "supersecret",
+            "url": "https://github.com",
+            "notes": "",
+            "custom_fields": {},
+            "updated_at": 100,
+            "deleted": false,
+        })
+        .to_string()
+    }
+
+    // --- Success/failure envelope -----------------------------------------
+
+    #[test]
+    fn error_envelope_reports_failure_without_data() {
+        let msg = assert_err(&wasm_vault_decrypt_entry(9999, "", "entry-1"));
+        assert!(msg.contains("vault is locked"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn malformed_input_yields_error_envelope_not_panic() {
+        // Each of these takes input that can't parse. None may panic or return
+        // malformed JSON — the JS caller gets a structured error instead.
+        assert_err(&wasm_vault_put_entry(1, "not json", "{}"));
+        assert_err(&wasm_unlock_vault("not json", "", "pw"));
+        assert_err(&wasm_generate_totp("!!!not-base32!!!", 30, 59, 6));
+        assert_err(&wasm_vault_rekey(1, "{}", "[bad json", "newpw"));
+        assert_err(&wasm_import_csv("!!! not base64 !!!"));
+        assert_err(&wasm_favorites_list(&empty_index_json(), "not-a-sort"));
+        assert_err(&wasm_collections_create(&empty_index_json(), "c1", "name", Some("ghost-parent".to_string()), 1));
+    }
+
+    // --- Vault handle lifecycle -------------------------------------------
+
+    #[test]
+    fn create_unlock_put_and_decrypt_roundtrip() {
+        let (handle, manifest, index_enc_b64) = make_vault();
+
+        // Unlock from the same manifest/index a second time yields a usable handle.
+        let unlocked = assert_ok(&wasm_unlock_vault(&manifest, &index_enc_b64, "master-pass"));
+        let h2 = unlocked["data"]["handle"].as_u64().unwrap();
+        assert_ne!(h2, handle, "each unlock gets its own handle");
+
+        let put = assert_ok(&wasm_vault_put_entry(handle, &empty_index_json(), &sample_entry_json("entry-1")));
+        let entry_enc_b64 = put["data"]["entry_enc_b64"].as_str().unwrap().to_string();
+        assert_eq!(put["data"]["index"]["entries"][0]["title"], "GitHub");
+
+        let decrypted = assert_ok(&wasm_vault_decrypt_entry(handle, &entry_enc_b64, "entry-1"));
+        assert_eq!(decrypted["data"]["password"], "supersecret");
+        assert_eq!(decrypted["data"]["title"], "GitHub");
+
+        wasm_lock_vault(handle);
+        wasm_lock_vault(h2);
+    }
+
+    #[test]
+    fn locked_handle_is_rejected_and_lock_is_idempotent() {
+        let (handle, _, _) = make_vault();
+        wasm_lock_vault(handle);
+
+        let msg = assert_err(&wasm_vault_decrypt_entry(handle, "AAAA", "entry-1"));
+        assert!(msg.contains("vault is locked"), "unexpected message: {msg}");
+
+        // Locking an already-locked or never-existing handle is a no-op.
+        wasm_lock_vault(handle);
+        wasm_lock_vault(4242);
+    }
+
+    #[test]
+    fn unlock_with_wrong_password_fails() {
+        let (_, manifest, index_enc_b64) = make_vault();
+        let msg = assert_err(&wasm_unlock_vault(&manifest, &index_enc_b64, "wrong-password"));
+        assert!(
+            msg.contains("wrong password or corrupted vault"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    #[test]
+    fn decrypt_entry_rejects_wrong_entry_id() {
+        // AAD binds each entry blob to its id, so a blob replayed under a
+        // different id must fail to decrypt rather than return the secret.
+        let (handle, _, _) = make_vault();
+        let put = assert_ok(&wasm_vault_put_entry(handle, &empty_index_json(), &sample_entry_json("entry-1")));
+        let entry_enc_b64 = put["data"]["entry_enc_b64"].as_str().unwrap();
+
+        assert_err(&wasm_vault_decrypt_entry(handle, entry_enc_b64, "entry-2"));
+        wasm_lock_vault(handle);
+    }
+
+    #[test]
+    fn rekey_rotates_key_and_old_password_stops_working() {
+        let (handle, _, _) = make_vault();
+        let put = assert_ok(&wasm_vault_put_entry(handle, &empty_index_json(), &sample_entry_json("entry-1")));
+        let entry_enc_b64 = put["data"]["entry_enc_b64"].as_str().unwrap().to_string();
+        let index = put["data"]["index"].to_string();
+
+        let entries = serde_json::json!([{ "id": "entry-1", "entry_enc_b64": entry_enc_b64 }]);
+        let rekeyed = assert_ok(&wasm_vault_rekey(
+            handle,
+            &index,
+            &entries.to_string(),
+            "brand-new-pass",
+        ));
+        let new_manifest = rekeyed["data"]["manifest"].to_string();
+        let new_index_enc_b64 = rekeyed["data"]["index_enc_b64"].as_str().unwrap().to_string();
+        let new_entry_enc_b64 = rekeyed["data"]["reencrypted_entries"][0]["new_entry_enc_b64"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // The mutated handle now works with the new material...
+        let decrypted = assert_ok(&wasm_vault_decrypt_entry(handle, &new_entry_enc_b64, "entry-1"));
+        assert_eq!(decrypted["data"]["password"], "supersecret");
+
+        // ...the new manifest unlocks under the new password...
+        let relocked =
+            assert_ok(&wasm_unlock_vault(&new_manifest, &new_index_enc_b64, "brand-new-pass"));
+        assert_eq!(relocked["data"]["index"]["entries"].as_array().unwrap().len(), 1);
+
+        // ...and no longer under the original password.
+        let (_old_handle, old_manifest, _old_index) = make_vault();
+        assert_err(&wasm_unlock_vault(&old_manifest, &new_index_enc_b64, "brand-new-pass"));
+        assert_err(&wasm_unlock_vault(&new_manifest, &new_index_enc_b64, "master-pass"));
+        wasm_lock_vault(handle);
+    }
+
+    // --- Pure pass-through functions ---------------------------------------
+
+    #[test]
+    fn generate_password_respects_length_and_bounds() {
+        let pw = assert_ok(&wasm_generate_password(24, true, true, true, true));
+        assert_eq!(pw["data"].as_str().unwrap().len(), 24);
+
+        assert_err(&wasm_generate_password(0, true, true, true, true));
+        assert_err(&wasm_generate_password(3, true, true, true, true));
+        assert_err(&wasm_generate_password(100_000, true, true, true, true));
+        // Every character class disabled leaves no charset to draw from.
+        assert_err(&wasm_generate_password(16, false, false, false, false));
+    }
+
+    #[test]
+    fn totp_matches_rfc6238_vector() {
+        let code = assert_ok(&wasm_generate_totp("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", 30, 59, 6));
+        assert_eq!(code["data"], "287082");
+        assert_err(&wasm_generate_totp("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", 0, 59, 6));
+        assert_err(&wasm_generate_totp("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", 30, 59, 100));
+    }
+
+    #[test]
+    fn breach_hash_parts_split_prefix_and_suffix() {
+        let parts = assert_ok(&wasm_get_breach_hash_parts("password"));
+        assert_eq!(parts["data"]["prefix"], "5BAA6");
+        assert_eq!(parts["data"]["suffix"], "1E4C9B93F3F0682250B6CF8331B7EE68FD8");
+    }
+
+    #[test]
+    fn search_and_merge_operate_on_index_json() {
+        let index = serde_json::json!({
+            "version": 1,
+            "entries": [{
+                "id": "e1", "title": "GitHub", "username": "octocat",
+                "url": "github.com", "updated_at": 1, "deleted": false
+            }]
+        })
+        .to_string();
+
+        let hits = assert_ok(&wasm_search_query(&index, "cat"));
+        assert_eq!(hits["data"].as_array().unwrap().len(), 1);
+        assert_eq!(hits["data"][0]["title"], "GitHub");
+
+        let merged = assert_ok(&wasm_merge_indexes(&index, &index));
+        assert_eq!(merged["data"]["merged_index"]["entries"].as_array().unwrap().len(), 1);
+        assert_err(&wasm_merge_indexes(&index, "not json"));
+    }
+
+    #[test]
+    fn sync_helpers_report_backoff_and_pending_state() {
+        assert_eq!(wasm_sync_retry_backoff(1), 2);
+        assert_eq!(wasm_sync_retry_backoff(2), 4);
+        assert_eq!(wasm_sync_retry_backoff(50), 64);
+
+        // `PendingChanges` has no serde defaults on its first two fields, so an empty
+        // object is malformed — both must be present.
+        let pending = serde_json::json!({
+            "pending_entry_ids": [],
+            "last_synced_index_version": 0,
+        })
+        .to_string();
+        let enqueued = assert_ok(&wasm_sync_pending_apply(&pending, "enqueue", "e1"));
+        assert_eq!(enqueued["data"]["pending_entry_ids"][0], "e1");
+
+        let dequeued =
+            assert_ok(&wasm_sync_pending_apply(&enqueued["data"].to_string(), "dequeue", "e1"));
+        assert!(dequeued["data"]["pending_entry_ids"].as_array().unwrap().is_empty());
+
+        assert_err(&wasm_sync_pending_apply(&pending, "not-an-operation", "e1"));
+        assert_err(&wasm_sync_resolve_conflict("{}", "{}", "not-a-strategy"));
+    }
+
+    #[test]
+    fn tag_lifecycle_roundtrips_through_json() {
+        let created = assert_ok(&wasm_tags_create(&empty_index_json(), "t1", "Work", 10));
+        assert_eq!(created["data"]["tag"]["name"], "Work");
+        let index = created["data"]["index"].to_string();
+
+        let listed = assert_ok(&wasm_tags_list(&index));
+        assert_eq!(listed["data"].as_array().unwrap().len(), 1);
+
+        let renamed = assert_ok(&wasm_tags_rename(&index, "t1", "Office", 11));
+        let renamed_index = renamed["data"].to_string();
+        let after_rename = assert_ok(&wasm_tags_list(&renamed_index));
+        assert_eq!(after_rename["data"][0]["name"], "Office");
+
+        // Unknown tag id is rejected rather than silently created.
+        assert_err(&wasm_tags_rename(&index, "nope", "X", 12));
+    }
+
+    #[test]
+    fn alias_provider_parsing_is_forgiving_of_spelling() {
+        // JS callers shouldn't have to match one exact casing convention.
+        for spelling in ["AddyIo", "addyio", "ADDY-IO"] {
+            let spec = assert_ok(&wasm_alias_list_request(spelling, "api-key"));
+            assert!(
+                spec["data"]["url"].as_str().unwrap().starts_with("https://app.addy.io"),
+                "unexpected url for {spelling}"
+            );
+        }
+        assert_err(&wasm_alias_parse_response("unknown-provider", "e30="));
+        assert_err(&wasm_alias_parse_response("addyio", "!!!not-base64!!!"));
+    }
+
+    #[test]
+    fn csv_import_export_roundtrip_through_wasm_boundary() {
+        let csv = "title,username,password,url,notes\n\
+                   Multi,u,p,https://x.com,\"line one\nline two\"\n";
+        let imported = assert_ok(&wasm_import_csv(&BASE64.encode(csv.as_bytes())));
+        let entries = imported["data"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "multi-line note must not split into two entries");
+        assert_eq!(entries[0]["notes"], "line one\nline two");
+
+        let exported = assert_ok(&wasm_export_csv(&imported["data"].to_string()));
+        let reimported = assert_ok(&wasm_import_csv(exported["data"].as_str().unwrap()));
+        assert_eq!(reimported["data"].as_array().unwrap().len(), 1);
+        assert_eq!(reimported["data"][0]["notes"], "line one\nline two");
+    }
+
+    #[test]
+    fn entry_helpers_operate_on_entry_json() {
+        let base = sample_entry_json("e1");
+
+        let changed = assert_ok(&wasm_entry_record_password_change(&base, "newpass", 100));
+        assert_eq!(changed["data"]["password"], "newpass");
+        assert_eq!(changed["data"]["password_history"][0]["password"], "supersecret");
+
+        let history = assert_ok(&wasm_entry_get_password_history(&changed["data"].to_string()));
+        assert_eq!(history["data"].as_array().unwrap().len(), 1);
+
+        let faved = assert_ok(&wasm_entry_set_favorite(&base, true));
+        assert_eq!(faved["data"]["favorite"], true);
+    }
+
+    #[test]
+    fn vault_generic_encrypt_decrypt_roundtrip_and_bad_handle() {
+        let (handle, _, _) = make_vault();
+        let ct = assert_ok(&wasm_vault_encrypt(handle, &BASE64.encode(b"hello"), &BASE64.encode(b"aad")));
+        let ct = ct["data"].as_str().unwrap().to_string();
+
+        let pt = assert_ok(&wasm_vault_decrypt(handle, &ct, &BASE64.encode(b"aad")));
+        assert_eq!(BASE64.decode(pt["data"].as_str().unwrap()).unwrap(), b"hello");
+
+        // AAD mismatch must fail rather than return garbage.
+        assert_err(&wasm_vault_decrypt(handle, &ct, &BASE64.encode(b"different-aad")));
+        wasm_lock_vault(handle);
+    }
 }
