@@ -1,6 +1,6 @@
 /// Vault import / export support.
 ///
-/// This module converts between the `fuin-core` [`Entry`] model and
+/// This module converts between the `domi-core` [`Entry`] model and
 /// well-known password-manager interchange formats.  **No networking** is
 /// performed here — callers supply raw bytes and receive structured data (or
 /// vice-versa).
@@ -63,7 +63,7 @@ struct BwExport {
 /// Written by `export_bitwarden_json`, consumed (and stripped back out of
 /// `custom_fields`) by `import_bitwarden_json`. Any Bitwarden-side client
 /// just sees an ordinary custom field and ignores it.
-const CATEGORY_OVERRIDE_FIELD: &str = "_fuin_original_category";
+const CATEGORY_OVERRIDE_FIELD: &str = "_domi_original_category";
 
 /// Parse a Bitwarden JSON export (unencrypted vault export from
 /// bitwarden.com → Tools → Export).
@@ -101,10 +101,10 @@ pub fn import_bitwarden_json(json_bytes: &[u8]) -> Result<Vec<Entry>, CoreError>
         // this export was produced by export_bitwarden_json — see
         // CATEGORY_OVERRIDE_FIELD. Strip the marker either way so it doesn't
         // show up as a visible junk custom field.
-        if let Some(marker) = custom_fields.remove(CATEGORY_OVERRIDE_FIELD) {
-            if marker == "BankAccount" {
-                category = ItemCategory::BankAccount;
-            }
+        if let Some(marker) = custom_fields.remove(CATEGORY_OVERRIDE_FIELD)
+            && marker == "BankAccount"
+        {
+            category = ItemCategory::BankAccount;
         }
 
         entries.push(Entry {
@@ -582,7 +582,7 @@ fn csv_field(value: &str) -> String {
 /// `"line one\nline two"` therefore stays a single record instead of splitting
 /// into two, which is what `str::lines()` did before (it cuts on every raw
 /// newline, producing a phantom extra entry for every embedded line break —
-/// including the ones Fuin's own `export_*_csv` functions write).
+/// including the ones Domi's own `export_*_csv` functions write).
 ///
 /// The returned records keep their embedded newlines verbatim; `split_csv_row`
 /// strips the surrounding quotes and un-escapes doubled `""` afterwards.
@@ -1017,7 +1017,7 @@ mod tests {
     // with an embedded line break — a multi-line note, a pasted passphrase —
     // therefore split into extra records, each importing as its own entry
     // with the continuation line's text landing in the first column. This
-    // also broke Fuin's own export → import round-trip, since every
+    // also broke Domi's own export → import round-trip, since every
     // `export_*_csv` below legitimately writes quoted multi-line fields.
 
     #[test]
@@ -1331,7 +1331,7 @@ mod tests {
 
     #[test]
     fn importing_third_party_csv_preserves_leading_equals_signs() {
-        // A CSV produced by another password manager (no Fuin escape prefix)
+        // A CSV produced by another password manager (no Domi escape prefix)
         // must import its values verbatim — we only strip a prefix we wrote.
         let csv = "title,username,password,url,notes\n=cmd,=SUM(A1),p,,plain\n";
         let entries = import_csv(csv.as_bytes()).unwrap();

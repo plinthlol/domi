@@ -224,8 +224,12 @@ impl AliasProvider for AddyIoProvider {
     fn parse_account_info_response(&self, bytes: &[u8]) -> Result<AliasAccountInfo, CoreError> {
         let parsed: AddyAccountEnvelope = serde_json::from_slice(bytes)
             .map_err(|e| CoreError::InvalidFormat(format!("addy.io account response error: {e}")))?;
+        // Both fields come straight from an untrusted provider response, so
+        // `limit - used` can overflow i64 (a body claiming
+        // `bandwidth: -9223372036854775808` did). Quota is display-only, so an
+        // out-of-range value degrades to "unknown quota" rather than erroring.
         let quota_remaining = match (parsed.data.bandwidth_limit, parsed.data.bandwidth) {
-            (Some(limit), Some(used)) if limit > 0 => Some(limit - used),
+            (Some(limit), Some(used)) if limit > 0 => limit.checked_sub(used),
             _ => None,
         };
         Ok(AliasAccountInfo {
@@ -528,5 +532,28 @@ mod tests {
     fn provider_for_returns_matching_kind() {
         assert_eq!(provider_for(AliasProviderKind::AddyIo).kind(), AliasProviderKind::AddyIo);
         assert_eq!(provider_for(AliasProviderKind::SimpleLogin).kind(), AliasProviderKind::SimpleLogin);
+    }
+
+    // Regression: the addy.io quota was `limit - used` on two untrusted i64
+    // fields, which overflowed and panicked when `used` was near i64::MIN —
+    // reachable straight from a provider response body.
+
+    #[test]
+    fn addy_quota_degrades_to_none_instead_of_overflowing() {
+        let provider = AddyIoProvider;
+        let body = br#"{"data":{"username":"u","bandwidth":-9223372036854775808,"bandwidth_limit":10000}}"#;
+        let info = provider.parse_account_info_response(body).unwrap();
+        assert_eq!(info.display_name.as_deref(), Some("u"));
+        assert_eq!(info.quota_remaining, None, "unrepresentable quota reads as unknown");
+    }
+
+    #[test]
+    fn addy_quota_still_computes_for_normal_and_negative_usage() {
+        let provider = AddyIoProvider;
+        // Ordinary over-quota usage: remaining clamps to a negative number,
+        // same as before the fix.
+        let body = br#"{"data":{"username":"u","bandwidth":15000,"bandwidth_limit":10000}}"#;
+        let info = provider.parse_account_info_response(body).unwrap();
+        assert_eq!(info.quota_remaining, Some(-5000));
     }
 }

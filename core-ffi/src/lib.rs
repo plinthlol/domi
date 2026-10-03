@@ -5,7 +5,7 @@
 #![allow(clippy::empty_line_after_doc_comments)]
 
 use base64::Engine;
-use fuin_core::{
+use domi_core::{
     assign_tag,
     check_strength as core_check_strength,
     create_collection,
@@ -61,13 +61,13 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-uniffi::include_scaffolding!("fuin");
+uniffi::include_scaffolding!("domi");
 
 const BASE64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
 
 #[derive(Debug, thiserror::Error)]
-pub enum FuinError {
+pub enum DomiError {
     #[error("wrong password or corrupted vault")]
     DecryptionFailed,
     #[error("vault is locked")]
@@ -84,38 +84,38 @@ pub enum FuinError {
     InvalidOperation { message: String },
 }
 
-impl From<CoreError> for FuinError {
+impl From<CoreError> for DomiError {
     fn from(e: CoreError) -> Self {
         match e {
-            CoreError::DecryptionFailed => FuinError::DecryptionFailed,
-            CoreError::VaultLocked => FuinError::VaultLocked,
-            CoreError::NotFound(id) => FuinError::NotFound { id },
-            CoreError::UnsupportedVersion(v) => FuinError::UnsupportedVersion { version: v },
-            CoreError::InvalidFormat(msg) => FuinError::InvalidFormat { message: msg },
-            CoreError::AlreadyExists(msg) => FuinError::AlreadyExists { message: msg },
-            CoreError::InvalidOperation(msg) => FuinError::InvalidOperation { message: msg },
+            CoreError::DecryptionFailed => DomiError::DecryptionFailed,
+            CoreError::VaultLocked => DomiError::VaultLocked,
+            CoreError::NotFound(id) => DomiError::NotFound { id },
+            CoreError::UnsupportedVersion(v) => DomiError::UnsupportedVersion { version: v },
+            CoreError::InvalidFormat(msg) => DomiError::InvalidFormat { message: msg },
+            CoreError::AlreadyExists(msg) => DomiError::AlreadyExists { message: msg },
+            CoreError::InvalidOperation(msg) => DomiError::InvalidOperation { message: msg },
         }
     }
 }
 
-fn base64_decode(s: &str) -> Result<Vec<u8>, FuinError> {
-    BASE64.decode(s).map_err(|e| FuinError::InvalidFormat {
+fn base64_decode(s: &str) -> Result<Vec<u8>, DomiError> {
+    BASE64.decode(s).map_err(|e| DomiError::InvalidFormat {
         message: format!("base64 decode error: {e}"),
     })
 }
 
-fn to_json<T: serde::Serialize>(value: &T) -> Result<String, FuinError> {
-    serde_json::to_string(value).map_err(|e| FuinError::InvalidFormat { message: e.to_string() })
+fn to_json<T: serde::Serialize>(value: &T) -> Result<String, DomiError> {
+    serde_json::to_string(value).map_err(|e| DomiError::InvalidFormat { message: e.to_string() })
 }
 
-fn parse_index(json: &str) -> Result<Index, FuinError> {
+fn parse_index(json: &str) -> Result<Index, DomiError> {
     serde_json::from_str(json)
-        .map_err(|e| FuinError::InvalidFormat { message: format!("bad index: {e}") })
+        .map_err(|e| DomiError::InvalidFormat { message: format!("bad index: {e}") })
 }
 
-fn parse_entry(json: &str) -> Result<Entry, FuinError> {
+fn parse_entry(json: &str) -> Result<Entry, DomiError> {
     serde_json::from_str(json)
-        .map_err(|e| FuinError::InvalidFormat { message: format!("bad entry: {e}") })
+        .map_err(|e| DomiError::InvalidFormat { message: format!("bad entry: {e}") })
 }
 
 // --- Opaque vault handle registry -----------------------------------------
@@ -124,7 +124,7 @@ fn parse_entry(json: &str) -> Result<Entry, FuinError> {
 // process, let alone this crate: Swift/Kotlin only ever see an opaque u64
 // handle. This replaces the previous design where create_vault/unlock_vault
 // derived the key a second time and returned it as a base64 String — see
-// AUDIT.md §1 / FUIN_AUDIT_FINDINGS.md [HIGH] for why that was unsafe.
+// AUDIT.md §1 / DOMI_AUDIT_FINDINGS.md [HIGH] for why that was unsafe.
 // Dropping a handle's entry (lock_vault, or process exit) runs Key's
 // ZeroizeOnDrop as normal.
 
@@ -141,23 +141,23 @@ fn next_handle() -> u64 {
 fn with_vault<T>(
     handle: u64,
     f: impl FnOnce(&Vault) -> Result<T, CoreError>,
-) -> Result<T, FuinError> {
-    let guard = vaults().lock().map_err(|_| FuinError::InvalidFormat {
+) -> Result<T, DomiError> {
+    let guard = vaults().lock().map_err(|_| DomiError::InvalidFormat {
         message: "vault registry lock poisoned".into(),
     })?;
-    let vault = guard.get(&handle).ok_or(FuinError::VaultLocked)?;
-    f(vault).map_err(FuinError::from)
+    let vault = guard.get(&handle).ok_or(DomiError::VaultLocked)?;
+    f(vault).map_err(DomiError::from)
 }
 
 fn with_vault_mut<T>(
     handle: u64,
     f: impl FnOnce(&mut Vault) -> Result<T, CoreError>,
-) -> Result<T, FuinError> {
-    let mut guard = vaults().lock().map_err(|_| FuinError::InvalidFormat {
+) -> Result<T, DomiError> {
+    let mut guard = vaults().lock().map_err(|_| DomiError::InvalidFormat {
         message: "vault registry lock poisoned".into(),
     })?;
-    let vault = guard.get_mut(&handle).ok_or(FuinError::VaultLocked)?;
-    f(vault).map_err(FuinError::from)
+    let vault = guard.get_mut(&handle).ok_or(DomiError::VaultLocked)?;
+    f(vault).map_err(DomiError::from)
 }
 
 pub struct CreateVaultResult {
@@ -166,16 +166,16 @@ pub struct CreateVaultResult {
     pub handle: u64,
 }
 
-pub fn create_vault(password: String) -> Result<CreateVaultResult, FuinError> {
+pub fn create_vault(password: String) -> Result<CreateVaultResult, DomiError> {
     let params = KdfParams::default();
-    let (vault, manifest, index_enc) = Vault::create(&password, params).map_err(FuinError::from)?;
+    let (vault, manifest, index_enc) = Vault::create(&password, params).map_err(DomiError::from)?;
     let handle = next_handle();
-    vaults().lock().map_err(|_| FuinError::InvalidFormat {
+    vaults().lock().map_err(|_| DomiError::InvalidFormat {
         message: "vault registry lock poisoned".into(),
     })?.insert(handle, vault);
     Ok(CreateVaultResult {
         manifest_json: serde_json::to_string(&manifest)
-            .map_err(|e| FuinError::InvalidFormat { message: e.to_string() })?,
+            .map_err(|e| DomiError::InvalidFormat { message: e.to_string() })?,
         index_enc_b64: BASE64.encode(&index_enc),
         handle,
     })
@@ -190,18 +190,18 @@ pub fn unlock_vault(
     manifest_json: String,
     index_enc_b64: String,
     password: String,
-) -> Result<UnlockVaultResult, FuinError> {
+) -> Result<UnlockVaultResult, DomiError> {
     let manifest: VaultManifest = serde_json::from_str(&manifest_json)
-        .map_err(|e| FuinError::InvalidFormat { message: format!("bad manifest: {e}") })?;
+        .map_err(|e| DomiError::InvalidFormat { message: format!("bad manifest: {e}") })?;
     let index_enc = base64_decode(&index_enc_b64)?;
-    let (vault, index) = Vault::unlock(&manifest, &index_enc, &password).map_err(FuinError::from)?;
+    let (vault, index) = Vault::unlock(&manifest, &index_enc, &password).map_err(DomiError::from)?;
     let handle = next_handle();
-    vaults().lock().map_err(|_| FuinError::InvalidFormat {
+    vaults().lock().map_err(|_| DomiError::InvalidFormat {
         message: "vault registry lock poisoned".into(),
     })?.insert(handle, vault);
     Ok(UnlockVaultResult {
         index_json: serde_json::to_string(&index)
-            .map_err(|e| FuinError::InvalidFormat { message: e.to_string() })?,
+            .map_err(|e| DomiError::InvalidFormat { message: e.to_string() })?,
         handle,
     })
 }
@@ -214,12 +214,12 @@ pub fn lock_vault(handle: u64) {
     }
 }
 
-pub fn vault_encrypt(handle: u64, plaintext: Vec<u8>, aad: Vec<u8>) -> Result<String, FuinError> {
+pub fn vault_encrypt(handle: u64, plaintext: Vec<u8>, aad: Vec<u8>) -> Result<String, DomiError> {
     let ciphertext = with_vault(handle, |v| v.encrypt(&plaintext, &aad))?;
     Ok(BASE64.encode(ciphertext))
 }
 
-pub fn vault_decrypt(handle: u64, ciphertext_b64: String, aad: Vec<u8>) -> Result<Vec<u8>, FuinError> {
+pub fn vault_decrypt(handle: u64, ciphertext_b64: String, aad: Vec<u8>) -> Result<Vec<u8>, DomiError> {
     let ciphertext = base64_decode(&ciphertext_b64)?;
     with_vault(handle, |v| v.decrypt(&ciphertext, &aad))
 }
@@ -228,10 +228,10 @@ pub fn vault_decrypt_entry(
     handle: u64,
     entry_enc_b64: String,
     entry_id: String,
-) -> Result<String, FuinError> {
+) -> Result<String, DomiError> {
     let entry_enc = base64_decode(&entry_enc_b64)?;
     let entry = with_vault(handle, |v| v.decrypt_entry(&entry_enc, &entry_id))?;
-    serde_json::to_string(&entry).map_err(|e| FuinError::InvalidFormat { message: e.to_string() })
+    serde_json::to_string(&entry).map_err(|e| DomiError::InvalidFormat { message: e.to_string() })
 }
 
 pub struct PutEntryResult {
@@ -244,11 +244,11 @@ pub fn vault_put_entry(
     handle: u64,
     index_json: String,
     entry_json: String,
-) -> Result<PutEntryResult, FuinError> {
+) -> Result<PutEntryResult, DomiError> {
     let mut index: Index = serde_json::from_str(&index_json)
-        .map_err(|e| FuinError::InvalidFormat { message: format!("bad index: {e}") })?;
+        .map_err(|e| DomiError::InvalidFormat { message: format!("bad index: {e}") })?;
     let entry: Entry = serde_json::from_str(&entry_json)
-        .map_err(|e| FuinError::InvalidFormat { message: format!("bad entry: {e}") })?;
+        .map_err(|e| DomiError::InvalidFormat { message: format!("bad entry: {e}") })?;
 
     let (entry_enc, index_enc) = with_vault(handle, |v| v.put_entry(&mut index, entry))?;
 
@@ -256,7 +256,7 @@ pub fn vault_put_entry(
         entry_enc_b64: BASE64.encode(entry_enc),
         index_enc_b64: BASE64.encode(index_enc),
         index_json: serde_json::to_string(&index)
-            .map_err(|e| FuinError::InvalidFormat { message: e.to_string() })?,
+            .map_err(|e| DomiError::InvalidFormat { message: e.to_string() })?,
     })
 }
 
@@ -281,7 +281,7 @@ pub fn vault_rekey(
     index_json: String,
     entries: Vec<RekeyEntryInputFfi>,
     new_password: String,
-) -> Result<RekeyResultFfi, FuinError> {
+) -> Result<RekeyResultFfi, DomiError> {
     let index = parse_index(&index_json)?;
     let mut decoded_entries = Vec::with_capacity(entries.len());
     for item in &entries {
@@ -297,7 +297,7 @@ pub fn vault_rekey(
     let res = with_vault_mut(handle, |v| v.rekey(&index, &refs, &new_password, params))?;
 
     let manifest_json = serde_json::to_string(&res.manifest)
-        .map_err(|e| FuinError::InvalidFormat { message: e.to_string() })?;
+        .map_err(|e| DomiError::InvalidFormat { message: e.to_string() })?;
     let index_enc_b64 = BASE64.encode(&res.index_enc);
     let reencrypted_entries = res
         .entries_enc
@@ -323,9 +323,9 @@ pub fn generate_password(
     lowercase: bool,
     numbers: bool,
     symbols: bool,
-) -> Result<String, FuinError> {
+) -> Result<String, DomiError> {
     core_generate_password(length as usize, uppercase, lowercase, numbers, symbols)
-        .map_err(FuinError::from)
+        .map_err(DomiError::from)
 }
 
 pub fn check_strength(password: String) -> u8 {
@@ -337,32 +337,32 @@ pub fn generate_totp(
     time_step_seconds: u64,
     current_unix_time: u64,
     digits: u32,
-) -> Result<String, FuinError> {
+) -> Result<String, DomiError> {
     core_generate_totp(&secret_base32, time_step_seconds, current_unix_time, digits)
-        .map_err(FuinError::from)
+        .map_err(DomiError::from)
 }
 
-pub fn get_breach_hash_parts(password: String) -> Result<BreachHashParts, FuinError> {
-    core_get_breach_hash_parts(&password).map_err(FuinError::from)
+pub fn get_breach_hash_parts(password: String) -> Result<BreachHashParts, DomiError> {
+    core_get_breach_hash_parts(&password).map_err(DomiError::from)
 }
 
-pub fn search_index(index_json: String, term: String) -> Result<String, FuinError> {
+pub fn search_index(index_json: String, term: String) -> Result<String, DomiError> {
     let index: Index = serde_json::from_str(&index_json)
-        .map_err(|e| FuinError::InvalidFormat { message: format!("bad index: {e}") })?;
+        .map_err(|e| DomiError::InvalidFormat { message: format!("bad index: {e}") })?;
     let cache = SearchCache::rebuild_from_index(&index);
     let items = cache.query(&term);
     serde_json::to_string(&items)
-        .map_err(|e| FuinError::InvalidFormat { message: e.to_string() })
+        .map_err(|e| DomiError::InvalidFormat { message: e.to_string() })
 }
 
-pub fn merge_indexes(local_json: String, remote_json: String) -> Result<String, FuinError> {
+pub fn merge_indexes(local_json: String, remote_json: String) -> Result<String, DomiError> {
     let local: Index = serde_json::from_str(&local_json)
-        .map_err(|e| FuinError::InvalidFormat { message: format!("bad local index: {e}") })?;
+        .map_err(|e| DomiError::InvalidFormat { message: format!("bad local index: {e}") })?;
     let remote: Index = serde_json::from_str(&remote_json)
-        .map_err(|e| FuinError::InvalidFormat { message: format!("bad remote index: {e}") })?;
-    let result = merge(&local, &remote).map_err(FuinError::from)?;
+        .map_err(|e| DomiError::InvalidFormat { message: format!("bad remote index: {e}") })?;
+    let result = merge(&local, &remote).map_err(DomiError::from)?;
     serde_json::to_string(&result)
-        .map_err(|e| FuinError::InvalidFormat { message: e.to_string() })
+        .map_err(|e| DomiError::InvalidFormat { message: e.to_string() })
 }
 
 pub struct PkcePair {
@@ -370,59 +370,59 @@ pub struct PkcePair {
     pub code_challenge: String,
 }
 
-pub fn generate_pkce() -> Result<PkcePair, FuinError> {
-    let pair = core_generate_pkce().map_err(FuinError::from)?;
+pub fn generate_pkce() -> Result<PkcePair, DomiError> {
+    let pair = core_generate_pkce().map_err(DomiError::from)?;
     Ok(PkcePair {
         code_verifier: pair.code_verifier,
         code_challenge: pair.code_challenge,
     })
 }
 
-pub fn generate_oauth_state() -> Result<String, FuinError> {
-    core_generate_oauth_state().map_err(FuinError::from)
+pub fn generate_oauth_state() -> Result<String, DomiError> {
+    core_generate_oauth_state().map_err(DomiError::from)
 }
 
 pub struct OAuthTokensFfi { pub access_token: String, pub refresh_token: Option<String>, pub expires_at: Option<i64> }
-impl From<fuin_core::OAuthTokens> for OAuthTokensFfi { fn from(t: fuin_core::OAuthTokens) -> Self { Self { access_token: t.access_token, refresh_token: t.refresh_token, expires_at: t.expires_at } } }
+impl From<domi_core::OAuthTokens> for OAuthTokensFfi { fn from(t: domi_core::OAuthTokens) -> Self { Self { access_token: t.access_token, refresh_token: t.refresh_token, expires_at: t.expires_at } } }
 
-pub fn build_auth_url(provider: String, client_id: String, redirect_uri: String, pkce_json: String, state: String) -> Result<String, FuinError> {
+pub fn build_auth_url(provider: String, client_id: String, redirect_uri: String, pkce_json: String, state: String) -> Result<String, DomiError> {
     let provider = parse_oauth_provider(&provider)?;
-    let pkce: fuin_core::PkcePair = serde_json::from_str(&pkce_json).map_err(|e| FuinError::InvalidFormat { message: e.to_string() })?;
+    let pkce: domi_core::PkcePair = serde_json::from_str(&pkce_json).map_err(|e| DomiError::InvalidFormat { message: e.to_string() })?;
     Ok(core_build_auth_url(provider, &client_id, &redirect_uri, &pkce, &state))
 }
 pub fn build_token_exchange_request(token_url: String, client_id: String, code: String, redirect_uri: String, verifier: String) -> HttpRequestSpecFfi {
     core_build_token_exchange_request(&token_url, &client_id, &code, &redirect_uri, &verifier).into()
 }
-pub fn parse_token_response(response_body: Vec<u8>, current_unix_time: i64) -> Result<OAuthTokensFfi, FuinError> { core_parse_token_response(&response_body, current_unix_time).map(Into::into).map_err(Into::into) }
-pub fn vault_encrypt_tokens(handle: u64, tokens_json: String) -> Result<String, FuinError> { let tokens: fuin_core::OAuthTokens = serde_json::from_str(&tokens_json).map_err(|e| FuinError::InvalidFormat { message: e.to_string() })?; Ok(BASE64.encode(with_vault(handle, |v| v.encrypt_tokens(&tokens))?)) }
-pub fn vault_decrypt_tokens(handle: u64, ciphertext_b64: String) -> Result<OAuthTokensFfi, FuinError> { let bytes = base64_decode(&ciphertext_b64)?; with_vault(handle, |v| v.decrypt_tokens(&bytes)).map(Into::into) }
-pub fn vault_save_search_cache(handle: u64, index_json: String) -> Result<String, FuinError> { let index = parse_index(&index_json)?; let cache = SearchCache::rebuild_from_index(&index); Ok(BASE64.encode(with_vault(handle, |v| v.save_search_cache(&cache))?)) }
-pub fn vault_load_search_cache_query(handle: u64, ciphertext_b64: String, term: String) -> Result<String, FuinError> { let bytes = base64_decode(&ciphertext_b64)?; let items = with_vault(handle, |v| v.load_search_cache(&bytes).map(|c| c.query(&term).into_iter().cloned().collect::<Vec<_>>()))?; to_json(&items) }
+pub fn parse_token_response(response_body: Vec<u8>, current_unix_time: i64) -> Result<OAuthTokensFfi, DomiError> { core_parse_token_response(&response_body, current_unix_time).map(Into::into).map_err(Into::into) }
+pub fn vault_encrypt_tokens(handle: u64, tokens_json: String) -> Result<String, DomiError> { let tokens: domi_core::OAuthTokens = serde_json::from_str(&tokens_json).map_err(|e| DomiError::InvalidFormat { message: e.to_string() })?; Ok(BASE64.encode(with_vault(handle, |v| v.encrypt_tokens(&tokens))?)) }
+pub fn vault_decrypt_tokens(handle: u64, ciphertext_b64: String) -> Result<OAuthTokensFfi, DomiError> { let bytes = base64_decode(&ciphertext_b64)?; with_vault(handle, |v| v.decrypt_tokens(&bytes)).map(Into::into) }
+pub fn vault_save_search_cache(handle: u64, index_json: String) -> Result<String, DomiError> { let index = parse_index(&index_json)?; let cache = SearchCache::rebuild_from_index(&index); Ok(BASE64.encode(with_vault(handle, |v| v.save_search_cache(&cache))?)) }
+pub fn vault_load_search_cache_query(handle: u64, ciphertext_b64: String, term: String) -> Result<String, DomiError> { let bytes = base64_decode(&ciphertext_b64)?; let items = with_vault(handle, |v| v.load_search_cache(&bytes).map(|c| c.query(&term).into_iter().cloned().collect::<Vec<_>>()))?; to_json(&items) }
 
-fn parse_oauth_provider(provider: &str) -> Result<fuin_core::OAuthProvider, FuinError> { match provider.to_lowercase().as_str() { "googledrive" | "google" => Ok(fuin_core::OAuthProvider::GoogleDrive), "dropbox" => Ok(fuin_core::OAuthProvider::Dropbox), "onedrive" | "microsoft" => Ok(fuin_core::OAuthProvider::OneDrive), other => Err(FuinError::InvalidFormat { message: format!("unknown OAuth provider: {other}") }) } }
-pub fn sync_pending_apply(pending_json: String, operation: String, id: String) -> Result<String, FuinError> { let mut p: PendingChanges = serde_json::from_str(&pending_json).map_err(|e| FuinError::InvalidFormat { message: e.to_string() })?; match operation.as_str() { "enqueue" => p.enqueue(&id), "dequeue" => p.dequeue(&id), "reset_retry" => p.reset_retry(&id), "record_failure" => { p.record_failure(&id); }, other => return Err(FuinError::InvalidOperation { message: format!("unknown pending operation: {other}") }) }; to_json(&p) }
-pub fn sync_retry_backoff(attempt: u32) -> u64 { fuin_core::retry_backoff_seconds(attempt) }
-pub fn sync_resolve_conflict(local_json: String, remote_json: String, strategy: String) -> Result<String, FuinError> { let local: fuin_core::IndexEntry = serde_json::from_str(&local_json).map_err(|e| FuinError::InvalidFormat { message: e.to_string() })?; let remote: fuin_core::IndexEntry = serde_json::from_str(&remote_json).map_err(|e| FuinError::InvalidFormat { message: e.to_string() })?; let strategy = match strategy.as_str() { "local" => ConflictStrategy::KeepLocal, "remote" => ConflictStrategy::KeepRemote, "newest" => ConflictStrategy::KeepNewest, other => return Err(FuinError::InvalidOperation { message: format!("unknown conflict strategy: {other}") }) }; to_json(&fuin_core::resolve_conflict(&local, &remote, strategy)) }
+fn parse_oauth_provider(provider: &str) -> Result<domi_core::OAuthProvider, DomiError> { match provider.to_lowercase().as_str() { "googledrive" | "google" => Ok(domi_core::OAuthProvider::GoogleDrive), "dropbox" => Ok(domi_core::OAuthProvider::Dropbox), "onedrive" | "microsoft" => Ok(domi_core::OAuthProvider::OneDrive), other => Err(DomiError::InvalidFormat { message: format!("unknown OAuth provider: {other}") }) } }
+pub fn sync_pending_apply(pending_json: String, operation: String, id: String) -> Result<String, DomiError> { let mut p: PendingChanges = serde_json::from_str(&pending_json).map_err(|e| DomiError::InvalidFormat { message: e.to_string() })?; match operation.as_str() { "enqueue" => p.enqueue(&id), "dequeue" => p.dequeue(&id), "reset_retry" => p.reset_retry(&id), "record_failure" => { p.record_failure(&id); }, other => return Err(DomiError::InvalidOperation { message: format!("unknown pending operation: {other}") }) }; to_json(&p) }
+pub fn sync_retry_backoff(attempt: u32) -> u64 { domi_core::retry_backoff_seconds(attempt) }
+pub fn sync_resolve_conflict(local_json: String, remote_json: String, strategy: String) -> Result<String, DomiError> { let local: domi_core::IndexEntry = serde_json::from_str(&local_json).map_err(|e| DomiError::InvalidFormat { message: e.to_string() })?; let remote: domi_core::IndexEntry = serde_json::from_str(&remote_json).map_err(|e| DomiError::InvalidFormat { message: e.to_string() })?; let strategy = match strategy.as_str() { "local" => ConflictStrategy::KeepLocal, "remote" => ConflictStrategy::KeepRemote, "newest" => ConflictStrategy::KeepNewest, other => return Err(DomiError::InvalidOperation { message: format!("unknown conflict strategy: {other}") }) }; to_json(&domi_core::resolve_conflict(&local, &remote, strategy)) }
 
 // ---------------------------------------------------------------------------
 // Password History
 // ---------------------------------------------------------------------------
 
-pub fn entry_record_password_change(entry_json: String, new_password: String, now: i64) -> Result<String, FuinError> {
-    let mut entry: Entry = serde_json::from_str(&entry_json).map_err(|e| FuinError::InvalidFormat { message: e.to_string() })?;
+pub fn entry_record_password_change(entry_json: String, new_password: String, now: i64) -> Result<String, DomiError> {
+    let mut entry: Entry = serde_json::from_str(&entry_json).map_err(|e| DomiError::InvalidFormat { message: e.to_string() })?;
     core_record_password_change(&mut entry, new_password, now);
     to_json(&entry)
 }
 
-pub fn entry_restore_password(entry_json: String, history_index: u32, now: i64) -> Result<String, FuinError> {
-    let mut entry: Entry = serde_json::from_str(&entry_json).map_err(|e| FuinError::InvalidFormat { message: e.to_string() })?;
+pub fn entry_restore_password(entry_json: String, history_index: u32, now: i64) -> Result<String, DomiError> {
+    let mut entry: Entry = serde_json::from_str(&entry_json).map_err(|e| DomiError::InvalidFormat { message: e.to_string() })?;
     core_restore_password(&mut entry, history_index as usize, now)?;
     to_json(&entry)
 }
 
-pub fn entry_get_password_history(entry_json: String) -> Result<String, FuinError> {
-    let entry: Entry = serde_json::from_str(&entry_json).map_err(|e| FuinError::InvalidFormat { message: e.to_string() })?;
-    let history = fuin_core::get_password_history(&entry);
+pub fn entry_get_password_history(entry_json: String) -> Result<String, DomiError> {
+    let entry: Entry = serde_json::from_str(&entry_json).map_err(|e| DomiError::InvalidFormat { message: e.to_string() })?;
+    let history = domi_core::get_password_history(&entry);
     to_json(&history)
 }
 
@@ -430,13 +430,13 @@ pub fn entry_get_password_history(entry_json: String) -> Result<String, FuinErro
 // Attachments
 // ---------------------------------------------------------------------------
 
-pub fn vault_encrypt_attachment(handle: u64, attachment_json: String, entry_id: String) -> Result<String, FuinError> {
-    let attachment: Attachment = serde_json::from_str(&attachment_json).map_err(|e| FuinError::InvalidFormat { message: e.to_string() })?;
+pub fn vault_encrypt_attachment(handle: u64, attachment_json: String, entry_id: String) -> Result<String, DomiError> {
+    let attachment: Attachment = serde_json::from_str(&attachment_json).map_err(|e| DomiError::InvalidFormat { message: e.to_string() })?;
     let enc = with_vault(handle, |v| v.encrypt_attachment(&attachment, &entry_id))?;
     Ok(BASE64.encode(enc))
 }
 
-pub fn vault_decrypt_attachment(handle: u64, ciphertext_b64: String, entry_id: String, attachment_id: String) -> Result<String, FuinError> {
+pub fn vault_decrypt_attachment(handle: u64, ciphertext_b64: String, entry_id: String, attachment_id: String) -> Result<String, DomiError> {
     let bytes = base64_decode(&ciphertext_b64)?;
     let attachment = with_vault(handle, |v| v.decrypt_attachment(&bytes, &entry_id, &attachment_id))?;
     to_json(&attachment)
@@ -446,48 +446,48 @@ pub fn vault_decrypt_attachment(handle: u64, ciphertext_b64: String, entry_id: S
 // Import / Export
 // ---------------------------------------------------------------------------
 
-pub fn import_bitwarden_json(json_b64: String) -> Result<String, FuinError> {
+pub fn import_bitwarden_json(json_b64: String) -> Result<String, DomiError> {
     let bytes = base64_decode(&json_b64)?;
     let entries = core_import_bitwarden_json(&bytes)?;
     to_json(&entries)
 }
 
-pub fn export_bitwarden_json(entries_json: String) -> Result<String, FuinError> {
-    let entries: Vec<Entry> = serde_json::from_str(&entries_json).map_err(|e| FuinError::InvalidFormat { message: e.to_string() })?;
+pub fn export_bitwarden_json(entries_json: String) -> Result<String, DomiError> {
+    let entries: Vec<Entry> = serde_json::from_str(&entries_json).map_err(|e| DomiError::InvalidFormat { message: e.to_string() })?;
     let bytes = core_export_bitwarden_json(&entries)?;
     Ok(BASE64.encode(bytes))
 }
 
-pub fn import_csv(csv_b64: String) -> Result<String, FuinError> {
+pub fn import_csv(csv_b64: String) -> Result<String, DomiError> {
     let bytes = base64_decode(&csv_b64)?;
     let entries = core_import_csv(&bytes)?;
     to_json(&entries)
 }
 
-pub fn export_csv(entries_json: String) -> Result<String, FuinError> {
-    let entries: Vec<Entry> = serde_json::from_str(&entries_json).map_err(|e| FuinError::InvalidFormat { message: e.to_string() })?;
+pub fn export_csv(entries_json: String) -> Result<String, DomiError> {
+    let entries: Vec<Entry> = serde_json::from_str(&entries_json).map_err(|e| DomiError::InvalidFormat { message: e.to_string() })?;
     Ok(BASE64.encode(core_export_csv(&entries)))
 }
 
-pub fn import_1password_csv(csv_b64: String) -> Result<String, FuinError> {
+pub fn import_1password_csv(csv_b64: String) -> Result<String, DomiError> {
     let bytes = base64_decode(&csv_b64)?;
     let entries = core_import_1password_csv(&bytes)?;
     to_json(&entries)
 }
 
-pub fn import_protonpass_csv(csv_b64: String) -> Result<String, FuinError> {
+pub fn import_protonpass_csv(csv_b64: String) -> Result<String, DomiError> {
     let bytes = base64_decode(&csv_b64)?;
     let entries = core_import_protonpass_csv(&bytes)?;
     to_json(&entries)
 }
 
-pub fn export_1password_csv(entries_json: String) -> Result<String, FuinError> {
-    let entries: Vec<Entry> = serde_json::from_str(&entries_json).map_err(|e| FuinError::InvalidFormat { message: e.to_string() })?;
+pub fn export_1password_csv(entries_json: String) -> Result<String, DomiError> {
+    let entries: Vec<Entry> = serde_json::from_str(&entries_json).map_err(|e| DomiError::InvalidFormat { message: e.to_string() })?;
     Ok(BASE64.encode(core_export_1password_csv(&entries)))
 }
 
-pub fn export_protonpass_csv(entries_json: String) -> Result<String, FuinError> {
-    let entries: Vec<Entry> = serde_json::from_str(&entries_json).map_err(|e| FuinError::InvalidFormat { message: e.to_string() })?;
+pub fn export_protonpass_csv(entries_json: String) -> Result<String, DomiError> {
+    let entries: Vec<Entry> = serde_json::from_str(&entries_json).map_err(|e| DomiError::InvalidFormat { message: e.to_string() })?;
     Ok(BASE64.encode(core_export_protonpass_csv(&entries)))
 }
 
@@ -500,15 +500,15 @@ pub struct TagResult {
     pub index_json: String,
 }
 
-pub fn tags_create(index_json: String, id: String, name: String, now: i64) -> Result<TagResult, FuinError> {
+pub fn tags_create(index_json: String, id: String, name: String, now: i64) -> Result<TagResult, DomiError> {
     let mut index = parse_index(&index_json)?;
-    let tag = create_tag(&mut index, id, &name, now).map_err(FuinError::from)?;
+    let tag = create_tag(&mut index, id, &name, now).map_err(DomiError::from)?;
     Ok(TagResult { tag_json: to_json(&tag)?, index_json: to_json(&index)? })
 }
 
-pub fn tags_rename(index_json: String, tag_id: String, new_name: String, now: i64) -> Result<String, FuinError> {
+pub fn tags_rename(index_json: String, tag_id: String, new_name: String, now: i64) -> Result<String, DomiError> {
     let mut index = parse_index(&index_json)?;
-    rename_tag(&mut index, &tag_id, &new_name, now).map_err(FuinError::from)?;
+    rename_tag(&mut index, &tag_id, &new_name, now).map_err(DomiError::from)?;
     to_json(&index)
 }
 
@@ -517,18 +517,18 @@ pub struct TagDeleteResult {
     pub affected_entry_ids: Vec<String>,
 }
 
-pub fn tags_delete(index_json: String, tag_id: String, now: i64) -> Result<TagDeleteResult, FuinError> {
+pub fn tags_delete(index_json: String, tag_id: String, now: i64) -> Result<TagDeleteResult, DomiError> {
     let mut index = parse_index(&index_json)?;
-    let affected_entry_ids = delete_tag(&mut index, &tag_id, now).map_err(FuinError::from)?;
+    let affected_entry_ids = delete_tag(&mut index, &tag_id, now).map_err(DomiError::from)?;
     Ok(TagDeleteResult { index_json: to_json(&index)?, affected_entry_ids })
 }
 
-pub fn tags_list(index_json: String) -> Result<String, FuinError> {
+pub fn tags_list(index_json: String) -> Result<String, DomiError> {
     let index = parse_index(&index_json)?;
     to_json(&list_tags(&index))
 }
 
-pub fn tags_search(index_json: String, tag_id: String) -> Result<String, FuinError> {
+pub fn tags_search(index_json: String, tag_id: String) -> Result<String, DomiError> {
     let index = parse_index(&index_json)?;
     to_json(&search_by_tag(&index, &tag_id))
 }
@@ -542,14 +542,14 @@ pub struct EntryTagResult {
 /// exists against `index_json` (see [`assign_tag`]) — callers should pass the
 /// same index the tag was created in. `changed` is `false` if the entry
 /// already had the tag.
-pub fn entry_assign_tag(index_json: String, entry_json: String, tag_id: String) -> Result<EntryTagResult, FuinError> {
+pub fn entry_assign_tag(index_json: String, entry_json: String, tag_id: String) -> Result<EntryTagResult, DomiError> {
     let index = parse_index(&index_json)?;
     let mut entry = parse_entry(&entry_json)?;
-    let changed = assign_tag(&index, &mut entry, &tag_id).map_err(FuinError::from)?;
+    let changed = assign_tag(&index, &mut entry, &tag_id).map_err(DomiError::from)?;
     Ok(EntryTagResult { entry_json: to_json(&entry)?, changed })
 }
 
-pub fn entry_remove_tag(entry_json: String, tag_id: String) -> Result<EntryTagResult, FuinError> {
+pub fn entry_remove_tag(entry_json: String, tag_id: String) -> Result<EntryTagResult, DomiError> {
     let mut entry = parse_entry(&entry_json)?;
     let changed = remove_tag_from_entry(&mut entry, &tag_id);
     Ok(EntryTagResult { entry_json: to_json(&entry)?, changed })
@@ -570,9 +570,9 @@ pub fn collections_create(
     name: String,
     parent_id: Option<String>,
     now: i64,
-) -> Result<CollectionResult, FuinError> {
+) -> Result<CollectionResult, DomiError> {
     let mut index = parse_index(&index_json)?;
-    let collection = create_collection(&mut index, id, &name, parent_id, now).map_err(FuinError::from)?;
+    let collection = create_collection(&mut index, id, &name, parent_id, now).map_err(DomiError::from)?;
     Ok(CollectionResult { collection_json: to_json(&collection)?, index_json: to_json(&index)? })
 }
 
@@ -581,9 +581,9 @@ pub fn collections_rename(
     collection_id: String,
     new_name: String,
     now: i64,
-) -> Result<String, FuinError> {
+) -> Result<String, DomiError> {
     let mut index = parse_index(&index_json)?;
-    rename_collection(&mut index, &collection_id, &new_name, now).map_err(FuinError::from)?;
+    rename_collection(&mut index, &collection_id, &new_name, now).map_err(DomiError::from)?;
     to_json(&index)
 }
 
@@ -592,28 +592,28 @@ pub struct CollectionDeleteResult {
     pub affected_entry_ids: Vec<String>,
 }
 
-pub fn collections_delete(index_json: String, collection_id: String, now: i64) -> Result<CollectionDeleteResult, FuinError> {
+pub fn collections_delete(index_json: String, collection_id: String, now: i64) -> Result<CollectionDeleteResult, DomiError> {
     let mut index = parse_index(&index_json)?;
-    let affected_entry_ids = delete_collection(&mut index, &collection_id, now).map_err(FuinError::from)?;
+    let affected_entry_ids = delete_collection(&mut index, &collection_id, now).map_err(DomiError::from)?;
     Ok(CollectionDeleteResult { index_json: to_json(&index)?, affected_entry_ids })
 }
 
-pub fn collections_list_root(index_json: String) -> Result<String, FuinError> {
+pub fn collections_list_root(index_json: String) -> Result<String, DomiError> {
     let index = parse_index(&index_json)?;
     to_json(&list_root(&index))
 }
 
-pub fn collections_list_children(index_json: String, parent_id: String) -> Result<String, FuinError> {
+pub fn collections_list_children(index_json: String, parent_id: String) -> Result<String, DomiError> {
     let index = parse_index(&index_json)?;
     to_json(&list_children(&index, &parent_id))
 }
 
-pub fn collections_search(index_json: String, collection_id: String) -> Result<String, FuinError> {
+pub fn collections_search(index_json: String, collection_id: String) -> Result<String, DomiError> {
     let index = parse_index(&index_json)?;
     to_json(&search_by_collection(&index, &collection_id))
 }
 
-pub fn entry_move_to_collection(entry_json: String, collection_id: Option<String>) -> Result<String, FuinError> {
+pub fn entry_move_to_collection(entry_json: String, collection_id: Option<String>) -> Result<String, DomiError> {
     let mut entry = parse_entry(&entry_json)?;
     move_entry(&mut entry, collection_id);
     to_json(&entry)
@@ -623,7 +623,7 @@ pub fn entry_move_to_collection(entry_json: String, collection_id: Option<String
 // Favorites
 // ---------------------------------------------------------------------------
 
-pub fn entry_set_favorite(entry_json: String, favorite: bool) -> Result<String, FuinError> {
+pub fn entry_set_favorite(entry_json: String, favorite: bool) -> Result<String, DomiError> {
     let mut entry = parse_entry(&entry_json)?;
     set_favorite(&mut entry, favorite);
     to_json(&entry)
@@ -643,12 +643,12 @@ impl From<FavoriteSortFfi> for FavoriteSort {
     }
 }
 
-pub fn favorites_list(index_json: String, sort: FavoriteSortFfi) -> Result<String, FuinError> {
+pub fn favorites_list(index_json: String, sort: FavoriteSortFfi) -> Result<String, DomiError> {
     let index = parse_index(&index_json)?;
     to_json(&list_favorites(&index, sort.into()))
 }
 
-pub fn favorites_search(index_json: String, term: String) -> Result<String, FuinError> {
+pub fn favorites_search(index_json: String, term: String) -> Result<String, DomiError> {
     let index = parse_index(&index_json)?;
     to_json(&search_favorites(&index, &term))
 }
@@ -667,11 +667,11 @@ pub enum AliasProviderKindFfi {
     SimpleLogin,
 }
 
-impl From<AliasProviderKindFfi> for fuin_core::AliasProviderKind {
+impl From<AliasProviderKindFfi> for domi_core::AliasProviderKind {
     fn from(k: AliasProviderKindFfi) -> Self {
         match k {
-            AliasProviderKindFfi::AddyIo => fuin_core::AliasProviderKind::AddyIo,
-            AliasProviderKindFfi::SimpleLogin => fuin_core::AliasProviderKind::SimpleLogin,
+            AliasProviderKindFfi::AddyIo => domi_core::AliasProviderKind::AddyIo,
+            AliasProviderKindFfi::SimpleLogin => domi_core::AliasProviderKind::SimpleLogin,
         }
     }
 }
@@ -682,9 +682,9 @@ pub struct CreateAliasOptionsFfi {
     pub description: Option<String>,
 }
 
-impl From<CreateAliasOptionsFfi> for fuin_core::CreateAliasOptions {
+impl From<CreateAliasOptionsFfi> for domi_core::CreateAliasOptions {
     fn from(o: CreateAliasOptionsFfi) -> Self {
-        fuin_core::CreateAliasOptions {
+        domi_core::CreateAliasOptions {
             local_part: o.local_part,
             domain: o.domain,
             description: o.description,
@@ -699,8 +699,8 @@ pub struct AliasRecordFfi {
     pub description: Option<String>,
 }
 
-impl From<fuin_core::AliasRecord> for AliasRecordFfi {
-    fn from(r: fuin_core::AliasRecord) -> Self {
+impl From<domi_core::AliasRecord> for AliasRecordFfi {
+    fn from(r: domi_core::AliasRecord) -> Self {
         AliasRecordFfi {
             provider_id: r.provider_id,
             email: r.email,
@@ -715,8 +715,8 @@ pub struct AliasAccountInfoFfi {
     pub quota_remaining: Option<i64>,
 }
 
-impl From<fuin_core::AliasAccountInfo> for AliasAccountInfoFfi {
-    fn from(i: fuin_core::AliasAccountInfo) -> Self {
+impl From<domi_core::AliasAccountInfo> for AliasAccountInfoFfi {
+    fn from(i: domi_core::AliasAccountInfo) -> Self {
         AliasAccountInfoFfi { display_name: i.display_name, quota_remaining: i.quota_remaining }
     }
 }
@@ -733,8 +733,8 @@ pub struct HttpRequestSpecFfi {
     pub body: Vec<u8>,
 }
 
-impl From<fuin_core::HttpRequestSpec> for HttpRequestSpecFfi {
-    fn from(spec: fuin_core::HttpRequestSpec) -> Self {
+impl From<domi_core::HttpRequestSpec> for HttpRequestSpecFfi {
+    fn from(spec: domi_core::HttpRequestSpec) -> Self {
         HttpRequestSpecFfi {
             url: spec.url,
             method: spec.method,
@@ -756,11 +756,11 @@ pub fn alias_create_request(
     provider_for(provider.into()).create_alias_request(&api_key, &options.into()).into()
 }
 
-pub fn alias_parse_response(provider: AliasProviderKindFfi, response_body: Vec<u8>) -> Result<AliasRecordFfi, FuinError> {
+pub fn alias_parse_response(provider: AliasProviderKindFfi, response_body: Vec<u8>) -> Result<AliasRecordFfi, DomiError> {
     provider_for(provider.into())
         .parse_alias_response(&response_body)
         .map(Into::into)
-        .map_err(FuinError::from)
+        .map_err(DomiError::from)
 }
 
 pub fn alias_delete_request(provider: AliasProviderKindFfi, api_key: String, provider_id: String) -> HttpRequestSpecFfi {
@@ -782,10 +782,10 @@ pub fn alias_list_request(provider: AliasProviderKindFfi, api_key: String) -> Ht
 pub fn alias_parse_list_response(
     provider: AliasProviderKindFfi,
     response_body: Vec<u8>,
-) -> Result<Vec<AliasRecordFfi>, FuinError> {
+) -> Result<Vec<AliasRecordFfi>, DomiError> {
     let records = provider_for(provider.into())
         .parse_alias_list_response(&response_body)
-        .map_err(FuinError::from)?;
+        .map_err(DomiError::from)?;
     Ok(records.into_iter().map(Into::into).collect())
 }
 
@@ -796,11 +796,11 @@ pub fn alias_account_info_request(provider: AliasProviderKindFfi, api_key: Strin
 pub fn alias_parse_account_info_response(
     provider: AliasProviderKindFfi,
     response_body: Vec<u8>,
-) -> Result<AliasAccountInfoFfi, FuinError> {
+) -> Result<AliasAccountInfoFfi, DomiError> {
     provider_for(provider.into())
         .parse_account_info_response(&response_body)
         .map(Into::into)
-        .map_err(FuinError::from)
+        .map_err(DomiError::from)
 }
 
 #[cfg(test)]
@@ -809,9 +809,9 @@ mod tests {
     use serde_json::Value;
 
     // The FFI surface differs from the WASM one in kind, not just in style:
-    // every fallible function returns a typed `Result<_, FuinError>` that
+    // every fallible function returns a typed `Result<_, DomiError>` that
     // UniFFI maps onto a thrown exception in Swift/Kotlin. These tests pin the
-    // mapping itself (CoreError -> FuinError variants) and the handle
+    // mapping itself (CoreError -> DomiError variants) and the handle
     // lifecycle, since a mistake in either shows up as the wrong exception
     // type on a platform shell rather than as a compile error.
 
@@ -876,15 +876,15 @@ mod tests {
         // variant must be exactly VaultLocked rather than a generic failure.
         assert!(matches!(
             vault_decrypt_entry(999_999, "AAAA".to_string(), "entry-1".to_string()),
-            Err(FuinError::VaultLocked)
+            Err(DomiError::VaultLocked)
         ));
         assert!(matches!(
             vault_encrypt(999_999, b"x".to_vec(), b"aad".to_vec()),
-            Err(FuinError::VaultLocked)
+            Err(DomiError::VaultLocked)
         ));
         assert!(matches!(
             vault_put_entry(999_999, empty_index_json(), sample_entry_json("e1")),
-            Err(FuinError::VaultLocked)
+            Err(DomiError::VaultLocked)
         ));
     }
 
@@ -899,7 +899,7 @@ mod tests {
 
         assert!(matches!(
             vault_decrypt_entry(handle, "AAAA".to_string(), "e1".to_string()),
-            Err(FuinError::VaultLocked)
+            Err(DomiError::VaultLocked)
         ));
     }
 
@@ -908,7 +908,7 @@ mod tests {
         let (_, manifest_json, index_enc_b64) = create_vault_for_test();
         assert!(matches!(
             unlock_vault(manifest_json, index_enc_b64, "wrong-pass".to_string()),
-            Err(FuinError::DecryptionFailed)
+            Err(DomiError::DecryptionFailed)
         ));
     }
 
@@ -916,11 +916,11 @@ mod tests {
     fn malformed_manifest_maps_to_invalid_format() {
         assert!(matches!(
             unlock_vault("not json".to_string(), "AAAA".to_string(), "pw".to_string()),
-            Err(FuinError::InvalidFormat { .. })
+            Err(DomiError::InvalidFormat { .. })
         ));
         assert!(matches!(
             unlock_vault("{}".to_string(), "!!!not base64!!!".to_string(), "pw".to_string()),
-            Err(FuinError::InvalidFormat { .. })
+            Err(DomiError::InvalidFormat { .. })
         ));
     }
 
@@ -933,7 +933,7 @@ mod tests {
 
         assert!(matches!(
             vault_decrypt_entry(handle, put.entry_enc_b64, "entry-2".to_string()),
-            Err(FuinError::DecryptionFailed)
+            Err(DomiError::DecryptionFailed)
         ));
         lock_vault(handle);
     }
@@ -947,7 +947,7 @@ mod tests {
         // Core formats this as "tag <id>"; assert on the id being surfaced rather
         // than on core's exact wording.
         match vault_put_entry(handle, empty_index_json(), entry.to_string()) {
-            Err(FuinError::NotFound { id }) => assert!(id.contains("ghost-tag"), "got {id}"),
+            Err(DomiError::NotFound { id }) => assert!(id.contains("ghost-tag"), "got {id}"),
             Err(e) => panic!("expected NotFound, got {e:?}"),
             Ok(_) => panic!("expected NotFound, got Ok"),
         }
@@ -960,7 +960,7 @@ mod tests {
     fn invalid_base64_maps_to_invalid_format() {
         assert!(matches!(
             base64_decode("!!! not base64 !!!"),
-            Err(FuinError::InvalidFormat { .. })
+            Err(DomiError::InvalidFormat { .. })
         ));
         assert_eq!(base64_decode("aGk=").unwrap(), b"hi");
     }
@@ -974,47 +974,47 @@ mod tests {
 
         assert!(matches!(
             vault_decrypt(handle, ct, b"different-aad".to_vec()),
-            Err(FuinError::DecryptionFailed)
+            Err(DomiError::DecryptionFailed)
         ));
         lock_vault(handle);
     }
 
-    // --- CoreError -> FuinError mapping ----------------------------------
+    // --- CoreError -> DomiError mapping ----------------------------------
 
-    /// Predicate checking that a `FuinError` is the expected variant.
-    type VariantCheck = fn(&FuinError) -> bool;
+    /// Predicate checking that a `DomiError` is the expected variant.
+    type VariantCheck = fn(&DomiError) -> bool;
 
     #[test]
     fn core_errors_map_to_the_matching_ffi_variants() {
-        // Each CoreError variant must land on the FuinError variant the UDL
+        // Each CoreError variant must land on the DomiError variant the UDL
         // declares, since that pairing drives the exception Swift/Kotlin catch.
         let cases: Vec<(CoreError, VariantCheck)> = vec![
-            (CoreError::DecryptionFailed, |e| matches!(e, FuinError::DecryptionFailed)),
-            (CoreError::VaultLocked, |e| matches!(e, FuinError::VaultLocked)),
+            (CoreError::DecryptionFailed, |e| matches!(e, DomiError::DecryptionFailed)),
+            (CoreError::VaultLocked, |e| matches!(e, DomiError::VaultLocked)),
             (
                 CoreError::NotFound("id-1".to_string()),
-                |e| matches!(e, FuinError::NotFound { id } if id == "id-1"),
+                |e| matches!(e, DomiError::NotFound { id } if id == "id-1"),
             ),
             (
                 CoreError::UnsupportedVersion(9),
-                |e| matches!(e, FuinError::UnsupportedVersion { version } if *version == 9),
+                |e| matches!(e, DomiError::UnsupportedVersion { version } if *version == 9),
             ),
             (
                 CoreError::InvalidFormat("bad".to_string()),
-                |e| matches!(e, FuinError::InvalidFormat { message } if message == "bad"),
+                |e| matches!(e, DomiError::InvalidFormat { message } if message == "bad"),
             ),
             (
                 CoreError::AlreadyExists("dup".to_string()),
-                |e| matches!(e, FuinError::AlreadyExists { message } if message == "dup"),
+                |e| matches!(e, DomiError::AlreadyExists { message } if message == "dup"),
             ),
             (
                 CoreError::InvalidOperation("nope".to_string()),
-                |e| matches!(e, FuinError::InvalidOperation { message } if message == "nope"),
+                |e| matches!(e, DomiError::InvalidOperation { message } if message == "nope"),
             ),
         ];
 
         for (core_err, check) in cases {
-            let ffi_err = FuinError::from(core_err);
+            let ffi_err = DomiError::from(core_err);
             assert!(check(&ffi_err), "variant mismatch: {ffi_err:?}");
         }
     }
@@ -1024,11 +1024,11 @@ mod tests {
         // Message text is what a user sees, so the Display strings are part
         // of the observable contract.
         assert_eq!(
-            FuinError::from(CoreError::NotFound("entry-7".to_string())).to_string(),
+            DomiError::from(CoreError::NotFound("entry-7".to_string())).to_string(),
             "entry not found: entry-7"
         );
         assert_eq!(
-            FuinError::from(CoreError::DecryptionFailed).to_string(),
+            DomiError::from(CoreError::DecryptionFailed).to_string(),
             "wrong password or corrupted vault"
         );
     }
@@ -1089,7 +1089,7 @@ mod tests {
                 serde_json::json!({ "code_verifier": "v", "code_challenge": "c" }).to_string(),
                 "s".to_string()
             ),
-            Err(FuinError::InvalidFormat { .. })
+            Err(DomiError::InvalidFormat { .. })
         ));
     }
 
@@ -1143,7 +1143,7 @@ mod tests {
 
         assert!(matches!(
             sync_pending_apply(pending, "nonsense".to_string(), "e1".to_string()),
-            Err(FuinError::InvalidOperation { .. })
+            Err(DomiError::InvalidOperation { .. })
         ));
     }
 
@@ -1174,7 +1174,7 @@ mod tests {
 
         assert!(matches!(
             tags_rename(created.index_json, "missing".to_string(), "X".to_string(), 12),
-            Err(FuinError::NotFound { .. })
+            Err(DomiError::NotFound { .. })
         ));
     }
 
@@ -1214,7 +1214,7 @@ mod tests {
 
         assert!(matches!(
             collections_delete(empty_index_json(), "nope".to_string(), 4),
-            Err(FuinError::NotFound { .. })
+            Err(DomiError::NotFound { .. })
         ));
     }
 
@@ -1244,7 +1244,7 @@ mod tests {
     fn import_rejects_invalid_base64() {
         assert!(matches!(
             import_csv("!!!not base64!!!".to_string()),
-            Err(FuinError::InvalidFormat { .. })
+            Err(DomiError::InvalidFormat { .. })
         ));
     }
 
@@ -1317,7 +1317,7 @@ mod tests {
 
         assert!(matches!(
             entry_restore_password(sample_entry_json("e1"), 0, 1),
-            Err(FuinError::NotFound { .. })
+            Err(DomiError::NotFound { .. })
         ));
     }
 
@@ -1367,7 +1367,7 @@ mod tests {
         .to_string();
         assert!(matches!(
             vault_encrypt_attachment(handle, lying, "entry-1".to_string()),
-            Err(FuinError::InvalidFormat { .. })
+            Err(DomiError::InvalidFormat { .. })
         ));
 
         lock_vault(handle);
@@ -1420,7 +1420,7 @@ mod tests {
 
         assert!(matches!(
             merge_indexes(local.clone(), "not json".to_string()),
-            Err(FuinError::InvalidFormat { .. })
+            Err(DomiError::InvalidFormat { .. })
         ));
     }
 
@@ -1454,7 +1454,7 @@ mod tests {
 
         assert!(matches!(
             sync_resolve_conflict(local, remote, "coin-flip".to_string()),
-            Err(FuinError::InvalidOperation { .. })
+            Err(DomiError::InvalidOperation { .. })
         ));
     }
 
@@ -1495,7 +1495,7 @@ mod tests {
         .is_ok());
         assert!(matches!(
             unlock_vault(manifest_json, rekeyed.index_enc_b64, "brand-new-pass".to_string()),
-            Err(FuinError::DecryptionFailed)
+            Err(DomiError::DecryptionFailed)
         ));
         lock_vault(handle);
     }

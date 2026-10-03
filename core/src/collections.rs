@@ -18,10 +18,10 @@ pub fn create_collection(
     if index.collections.iter().any(|collection| collection.id == id) {
         return Err(CoreError::AlreadyExists(format!("collection id '{id}' already exists")));
     }
-    if let Some(parent) = &parent_id {
-        if !index.collections.iter().any(|c| &c.id == parent && !c.deleted) {
-            return Err(CoreError::NotFound(format!("collection {parent}")));
-        }
+    if let Some(parent) = &parent_id
+        && !index.collections.iter().any(|c| &c.id == parent && !c.deleted)
+    {
+        return Err(CoreError::NotFound(format!("collection {parent}")));
     }
     if index.collections.iter().any(|c| {
         !c.deleted && c.parent_id == parent_id && c.name.eq_ignore_ascii_case(name)
@@ -107,11 +107,11 @@ pub fn delete_collection(index: &mut Index, collection_id: &str, now: i64) -> Re
 
     let mut affected = Vec::new();
     for e in index.entries.iter_mut() {
-        if let Some(cid) = &e.collection_id {
-            if to_delete.contains(cid) {
-                e.collection_id = None;
-                affected.push(e.id.clone());
-            }
+        if let Some(cid) = &e.collection_id
+            && to_delete.contains(cid)
+        {
+            e.collection_id = None;
+            affected.push(e.id.clone());
         }
     }
     Ok(affected)

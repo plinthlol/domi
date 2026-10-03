@@ -1,12 +1,12 @@
 [package]
-name = "fuin-core"
+name = "domi-core"
 version = "0.1.0"
-edition = "2021"
-description = "Platform-agnostic crypto, vault format, and business logic for Fuin."
+edition = "2024"
+description = "Platform-agnostic crypto, vault format, and business logic for Domi."
 license = "MIT OR Apache-2.0"
 
 [lib]
-name = "fuin_core"
+name = "domi_core"
 path = "src/lib.rs"
 
 [dependencies]

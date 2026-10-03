@@ -1,133 +1,133 @@
-namespace fuin {
-    [Throws=FuinError]
+namespace domi {
+    [Throws=DomiError]
     CreateVaultResult create_vault(string password);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     UnlockVaultResult unlock_vault(string manifest_json, string index_enc_b64, string password);
 
     void lock_vault(u64 handle);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string vault_encrypt(u64 handle, bytes plaintext, bytes aad);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     bytes vault_decrypt(u64 handle, string ciphertext_b64, bytes aad);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string vault_decrypt_entry(u64 handle, string entry_enc_b64, string entry_id);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     PutEntryResult vault_put_entry(u64 handle, string index_json, string entry_json);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     RekeyResultFfi vault_rekey(u64 handle, string index_json, sequence<RekeyEntryInputFfi> entries, string new_password);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string generate_password(u32 length, boolean uppercase, boolean lowercase, boolean numbers, boolean symbols);
 
     u8 check_strength(string password);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string generate_totp(string secret_base32, u64 time_step_seconds, u64 current_unix_time, u32 digits);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     BreachHashParts get_breach_hash_parts(string password);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string search_index(string index_json, string term);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string merge_indexes(string local_json, string remote_json);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     PkcePair generate_pkce();
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string generate_oauth_state();
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string build_auth_url(string provider, string client_id, string redirect_uri, string pkce_json, string state);
 
     HttpRequestSpecFfi build_token_exchange_request(string token_url, string client_id, string code, string redirect_uri, string verifier);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     OAuthTokensFfi parse_token_response(bytes response_body, i64 current_unix_time);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string vault_encrypt_tokens(u64 handle, string tokens_json);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     OAuthTokensFfi vault_decrypt_tokens(u64 handle, string ciphertext_b64);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string vault_save_search_cache(u64 handle, string index_json);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string vault_load_search_cache_query(u64 handle, string ciphertext_b64, string term);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string sync_pending_apply(string pending_json, string operation, string id);
 
     u64 sync_retry_backoff(u32 attempt);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string sync_resolve_conflict(string local_json, string remote_json, string strategy);
 
     // --- Tags ---
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     TagResult tags_create(string index_json, string id, string name, i64 now);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string tags_rename(string index_json, string tag_id, string new_name, i64 now);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     TagDeleteResult tags_delete(string index_json, string tag_id, i64 now);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string tags_list(string index_json);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string tags_search(string index_json, string tag_id);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     EntryTagResult entry_assign_tag(string index_json, string entry_json, string tag_id);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     EntryTagResult entry_remove_tag(string entry_json, string tag_id);
 
     // --- Collections ---
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     CollectionResult collections_create(string index_json, string id, string name, string? parent_id, i64 now);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string collections_rename(string index_json, string collection_id, string new_name, i64 now);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     CollectionDeleteResult collections_delete(string index_json, string collection_id, i64 now);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string collections_list_root(string index_json);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string collections_list_children(string index_json, string parent_id);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string collections_search(string index_json, string collection_id);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string entry_move_to_collection(string entry_json, string? collection_id);
 
     // --- Favorites ---
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string entry_set_favorite(string entry_json, boolean favorite);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string favorites_list(string index_json, FavoriteSortFfi sort);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string favorites_search(string index_json, string term);
 
     // --- Email alias manager ---
@@ -137,7 +137,7 @@ namespace fuin {
 
     HttpRequestSpecFfi alias_create_request(AliasProviderKindFfi provider, string api_key, CreateAliasOptionsFfi options);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     AliasRecordFfi alias_parse_response(AliasProviderKindFfi provider, bytes response_body);
 
     HttpRequestSpecFfi alias_delete_request(AliasProviderKindFfi provider, string api_key, string provider_id);
@@ -148,62 +148,62 @@ namespace fuin {
 
     HttpRequestSpecFfi alias_list_request(AliasProviderKindFfi provider, string api_key);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     sequence<AliasRecordFfi> alias_parse_list_response(AliasProviderKindFfi provider, bytes response_body);
 
     HttpRequestSpecFfi alias_account_info_request(AliasProviderKindFfi provider, string api_key);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     AliasAccountInfoFfi alias_parse_account_info_response(AliasProviderKindFfi provider, bytes response_body);
 
     // --- Password History ---
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string entry_record_password_change(string entry_json, string new_password, i64 now);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string entry_restore_password(string entry_json, u32 history_index, i64 now);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string entry_get_password_history(string entry_json);
 
     // --- Attachments ---
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string vault_encrypt_attachment(u64 handle, string attachment_json, string entry_id);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string vault_decrypt_attachment(u64 handle, string ciphertext_b64, string entry_id, string attachment_id);
 
     // --- Import / Export ---
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string import_bitwarden_json(string json_b64);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string export_bitwarden_json(string entries_json);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string import_csv(string csv_b64);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string export_csv(string entries_json);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string import_1password_csv(string csv_b64);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string import_protonpass_csv(string csv_b64);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string export_1password_csv(string entries_json);
 
-    [Throws=FuinError]
+    [Throws=DomiError]
     string export_protonpass_csv(string entries_json);
 };
 
 [Error]
-interface FuinError {
+interface DomiError {
     DecryptionFailed();
     VaultLocked();
     NotFound(string id);
