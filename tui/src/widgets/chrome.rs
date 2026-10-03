@@ -52,7 +52,7 @@ pub fn Header(props: &mut HeaderProps) -> impl Into<AnyElement<'static>> {
 
     let mut left: Vec<Element<'static, Text>> = Vec::new();
     left.push(element! {
-        Text(content: "Fuin", color: Some(theme::ACCENT), weight: Weight::Bold)
+        Text(content: "Domi", color: Some(theme::ACCENT), weight: Weight::Bold)
     });
     left.push(element! {
         Text(content: screen_title, color: Some(theme::BORDER))

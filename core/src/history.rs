@@ -4,9 +4,8 @@ use crate::vault::{Entry, PasswordHistoryItem};
 const MAX_HISTORY_ENTRIES: usize = 25;
 
 /// Records the entry's *current* password into its history before it is
-/// overwritten with `new_password`.  Keeps at most [`MAX_HISTORY_ENTRIES`]
-/// items (oldest removed first).  No-op if the new password equals the
-/// current one.
+/// overwritten with `new_password`.  Keeps at most 25 items (oldest removed
+/// first).  No-op if the new password equals the current one.
 pub fn record_password_change(entry: &mut Entry, new_password: String, now: i64) {
     if entry.password == new_password {
         return;

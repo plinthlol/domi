@@ -162,7 +162,22 @@ pub fn parse_token_response(bytes: &[u8], current_unix_time: i64) -> Result<OAut
     let parsed: TokenResponse = serde_json::from_slice(bytes)
         .map_err(|e| CoreError::InvalidFormat(format!("oauth response error: {e}")))?;
 
-    let expires_at = parsed.expires_in.map(|secs| current_unix_time + secs);
+    // `expires_in` is a number from an untrusted provider response, so adding
+    // it to the caller's clock can overflow i64 (a body claiming
+    // `expires_in: 9223372036854775807` did). Reject the response instead.
+    //
+    // Saturating here would be wrong in a way it is fine for `index.version`:
+    // a pinned i64::MAX expiry means "never refresh", so a stale or revoked
+    // token would stay in use indefinitely. A malformed `expires_in` is the
+    // provider's bug, and reporting it beats silently trusting the token.
+    let expires_at = match parsed.expires_in {
+        Some(secs) => Some(current_unix_time.checked_add(secs).ok_or_else(|| {
+            CoreError::InvalidFormat(format!(
+                "token response expires_in ({secs}) is out of range for the current time"
+            ))
+        })?),
+        None => None,
+    };
 
     Ok(OAuthTokens {
         access_token: parsed.access_token,
@@ -220,12 +235,12 @@ mod tests {
         let url = build_auth_url(
             OAuthProvider::Dropbox,
             "client&other=value",
-            "com.fuin:/callback?source=app&next=1",
+            "com.domi:/callback?source=app&next=1",
             &pkce,
             "state&other=value",
         );
         assert!(url.contains("client_id=client%26other%3Dvalue"));
-        assert!(url.contains("redirect_uri=com.fuin%3A%2Fcallback%3Fsource%3Dapp%26next%3D1"));
+        assert!(url.contains("redirect_uri=com.domi%3A%2Fcallback%3Fsource%3Dapp%26next%3D1"));
         assert!(url.contains("code_challenge=challenge%2Bpart"));
         assert!(url.contains("state=state%26other%3Dvalue"));
 
@@ -233,11 +248,11 @@ mod tests {
             "https://provider.example/token",
             "client&other=value",
             "code&other=value",
-            "com.fuin:/callback?source=app&next=1",
+            "com.domi:/callback?source=app&next=1",
             &pkce.code_verifier,
         );
         let body = String::from_utf8(request.body).unwrap();
-        assert_eq!(body, "grant_type=authorization_code&client_id=client%26other%3Dvalue&code=code%26other%3Dvalue&redirect_uri=com.fuin%3A%2Fcallback%3Fsource%3Dapp%26next%3D1&code_verifier=verifier%26part");
+        assert_eq!(body, "grant_type=authorization_code&client_id=client%26other%3Dvalue&code=code%26other%3Dvalue&redirect_uri=com.domi%3A%2Fcallback%3Fsource%3Dapp%26next%3D1&code_verifier=verifier%26part");
     }
 
     #[test]
@@ -253,5 +268,40 @@ mod tests {
         let enc = encrypt_tokens(&key, &tokens).unwrap();
         let dec = decrypt_tokens(&key, &enc).unwrap();
         assert_eq!(dec, tokens);
+    }
+
+    // Regression: `expires_at` was `current_unix_time + expires_in`, which
+    // overflowed and panicked on a provider response claiming
+    // `expires_in: i64::MAX`. `parse_token_response` is reachable with raw
+    // bytes straight off the wire on both the FFI and WASM boundary, so a
+    // malformed response crashed the app instead of surfacing an error.
+
+    #[test]
+    fn parse_token_response_rejects_out_of_range_expires_in() {
+        let body = br#"{"access_token":"tok","expires_in":9223372036854775807}"#;
+        let now = 1_700_000_000;
+        assert!(matches!(
+            parse_token_response(body, now),
+            Err(CoreError::InvalidFormat(_))
+        ));
+    }
+
+    #[test]
+    fn parse_token_response_accepts_the_largest_in_range_expiry() {
+        // One below the boundary must still work — the fix rejects only what
+        // genuinely cannot be represented.
+        let body = format!(
+            r#"{{"access_token":"tok","expires_in":{}}}"#,
+            i64::MAX - 1_700_000_000
+        );
+        let tokens = parse_token_response(body.as_bytes(), 1_700_000_000).unwrap();
+        assert_eq!(tokens.expires_at, Some(i64::MAX));
+    }
+
+    #[test]
+    fn parse_token_response_omits_expiry_when_absent() {
+        let tokens = parse_token_response(br#"{"access_token":"tok"}"#, 1_700_000_000).unwrap();
+        assert_eq!(tokens.access_token, "tok");
+        assert_eq!(tokens.expires_at, None);
     }
 }

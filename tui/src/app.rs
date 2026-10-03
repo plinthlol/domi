@@ -217,10 +217,10 @@ fn submit_password(state: &mut AppState) {
 /// Interprets `Action::SaveForm` for whichever modal or screen is open.
 fn confirm(state: &mut AppState) {
     let Some(m) = state.modal.clone() else {
-        if state.screen == Screen::Edit {
-            if let Err(e) = state.save_form() {
-                state.notify_error(e);
-            }
+        if state.screen == Screen::Edit
+            && let Err(e) = state.save_form()
+        {
+            state.notify_error(e);
         }
         return;
     };
@@ -573,6 +573,9 @@ fn setup_body(state: &RenderSnapshot) -> AnyElement<'static> {
                 View(flex_shrink: 0_f32, margin_bottom: 1_u32, overflow: Some(Overflow::Hidden)) {
                     Text(content: state.path.clone(), color: Some(theme::MUTED))
                 }
+                View(flex_shrink: 0_f32, margin_top: 1_u32) {
+                    Text(content: "Master password", color: Some(theme::MUTED))
+                }
                 View(flex_shrink: 0_f32) {
                     TextInput(
                         value: state.password.clone(),
@@ -582,6 +585,9 @@ fn setup_body(state: &RenderSnapshot) -> AnyElement<'static> {
                     )
                 }
                 View(flex_shrink: 0_f32, margin_top: 1_u32) {
+                    Text(content: "Confirm password", color: Some(theme::MUTED))
+                }
+                View(flex_shrink: 0_f32) {
                     TextInput(
                         value: state.confirm.clone(),
                         has_focus: false,
@@ -627,7 +633,7 @@ fn unlock_body(state: &RenderSnapshot) -> AnyElement<'static> {
                 padding_bottom: 1_u32,
             ) {
                 View(flex_shrink: 0_f32, margin_bottom: 1_u32) {
-                    Text(content: "Fuin", color: Some(theme::ACCENT), weight: Weight::Bold)
+                    Text(content: "Domi", color: Some(theme::ACCENT), weight: Weight::Bold)
                 }
                 View(flex_shrink: 0_f32, margin_bottom: 1_u32) {
                     Text(content: "Enter your master password", color: Some(theme::MUTED))
@@ -867,7 +873,7 @@ mod tests {
     }
 
     fn with_screen(screen: Screen) -> RenderSnapshot {
-        let mut s = state_at("/tmp/fuin-app-test");
+        let mut s = state_at("/tmp/domi-app-test");
         s.screen = screen;
         s.clone_for_render()
     }
@@ -938,12 +944,12 @@ mod tests {
         state.total_entries = 3;
         state.session_present = true;
         let frame = render_to_text(&state, 100, 24);
-        assert!(frame.contains("Fuin"), "{frame}");
+        assert!(frame.contains("Domi"), "{frame}");
         assert!(frame.contains("Vault"), "{frame}");
         assert!(frame.contains("GitHub"), "{frame}");
         assert!(frame.contains("3 entries"), "{frame}");
         // The app name appears once; the screen name is a separate word.
-        assert_eq!(frame.matches("Fuin").count(), 1, "the name is repeated:\n{frame}");
+        assert_eq!(frame.matches("Domi").count(), 1, "the name is repeated:\n{frame}");
     }
 
     #[test]
@@ -1118,7 +1124,7 @@ mod tests {
 
     #[test]
     fn input_handlers_park_values_and_drain_moves_them_into_state() {
-        let mut s = state_at("/tmp/fuin-app-test");
+        let mut s = state_at("/tmp/domi-app-test");
         assert!(!drain_input(&mut s), "nothing parked yet");
 
         password_input_handler()("secret".into());
@@ -1130,7 +1136,7 @@ mod tests {
 
     #[test]
     fn typing_a_password_clears_a_previous_error() {
-        let mut s = state_at("/tmp/fuin-app-test");
+        let mut s = state_at("/tmp/domi-app-test");
         s.screen_error = Some("Wrong password".into());
         password_input_handler()("a".into());
         drain_input(&mut s);
@@ -1139,7 +1145,7 @@ mod tests {
 
     #[test]
     fn setup_input_parks_both_fields_separately() {
-        let mut s = state_at("/tmp/fuin-app-test");
+        let mut s = state_at("/tmp/domi-app-test");
         setup_input_handler(0)("first".into());
         setup_input_handler(1)("second".into());
         drain_input(&mut s);
@@ -1149,7 +1155,7 @@ mod tests {
 
     #[test]
     fn a_modal_value_lands_in_the_confirm_slot() {
-        let mut s = state_at("/tmp/fuin-app-test");
+        let mut s = state_at("/tmp/domi-app-test");
         modal_input_handler()("typed".into());
         drain_input(&mut s);
         assert_eq!(s.confirm, "typed");
@@ -1157,7 +1163,7 @@ mod tests {
 
     #[test]
     fn the_query_handler_updates_the_filtered_rows() {
-        let mut s = state_at("/tmp/fuin-app-test");
+        let mut s = state_at("/tmp/domi-app-test");
         query_input_handler()("git".into());
         assert!(drain_input(&mut s));
         assert_eq!(s.query, "git");
@@ -1165,7 +1171,7 @@ mod tests {
 
     #[test]
     fn the_form_handler_lands_on_the_right_field() {
-        let mut s = state_at("/tmp/fuin-app-test");
+        let mut s = state_at("/tmp/domi-app-test");
         s.begin_new_entry();
         form_change_factory()(Field::Username)("octocat".into());
         drain_input(&mut s);
@@ -1178,7 +1184,7 @@ mod tests {
 
     #[test]
     fn a_failed_unlock_reports_the_error_and_stays_put() {
-        let mut s = state_at("/tmp/fuin-does-not-exist");
+        let mut s = state_at("/tmp/domi-does-not-exist");
         s.password = "wrong".into();
         submit_password(&mut s);
         assert!(s.screen_error.is_some(), "a wrong password must report an error");
@@ -1188,7 +1194,7 @@ mod tests {
 
     #[test]
     fn submitting_with_a_vault_absent_does_not_panic() {
-        let mut s = state_at("/tmp/fuin-does-not-exist");
+        let mut s = state_at("/tmp/domi-does-not-exist");
         s.password = "hunter2".into();
         s.confirm = "hunter2".into();
         s.screen = Screen::Setup;
@@ -1200,7 +1206,7 @@ mod tests {
 
     #[test]
     fn the_header_shows_the_filter_when_no_entry_is_selected() {
-        let mut s = state_at("/tmp/fuin-app-test");
+        let mut s = state_at("/tmp/domi-app-test");
         s.screen = Screen::Vault;
         s.filter = Filter::Favorites;
         assert_eq!(s.clone_for_render().context, "Favorites");
@@ -1227,7 +1233,7 @@ mod tests {
     #[test]
     fn the_settings_rows_are_all_visible_on_screen() {
         let mut state = with_screen(Screen::Settings);
-        state.path = "/tmp/fuin-app-test".into();
+        state.path = "/tmp/domi-app-test".into();
         let frame = render_to_text(&state, 100, 24);
         for label in ["Vault", "Key derivation", "Auto-lock", "Master password", "Close vault"] {
             assert!(frame.contains(label), "{label} is missing:\n{frame}");

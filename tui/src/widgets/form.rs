@@ -8,7 +8,7 @@
 
 use iocraft::prelude::*;
 
-use fuin_core::check_strength;
+use domi_core::check_strength;
 
 use crate::state::{EntryForm, Field};
 use crate::theme;

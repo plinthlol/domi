@@ -6,8 +6,8 @@
 //! sitting on screen, and no risk of an in-place keystroke overwriting a
 //! password the user meant to copy.
 
-use fuin_core::vault::{Entry, ItemCategory};
-use fuin_core::{check_strength, generate_totp, now_unix};
+use domi_core::vault::{Entry, ItemCategory};
+use domi_core::{check_strength, generate_totp, now_unix};
 use iocraft::prelude::*;
 
 use crate::theme;

@@ -27,6 +27,7 @@ pub const SUCCESS: Color = Color::Green;
 /// Panel outline.
 pub const PANEL_BORDER: BorderStyle = BorderStyle::Round;
 
+
 /// The outer app frame.
 pub const APP_BORDER: BorderStyle = BorderStyle::Single;
 
@@ -81,7 +82,7 @@ pub fn mask(secret: &str) -> String {
 /// ("3d ago"), which is computable from the current time with no formatting
 /// machinery.
 pub fn relative_time(unix_secs: i64) -> String {
-    let now = fuin_core::now_unix();
+    let now = domi_core::now_unix();
     let delta = now - unix_secs;
     if delta < 60 {
         "just now".to_string()
@@ -169,7 +170,7 @@ mod tests {
 
     #[test]
     fn relative_time_is_recent_for_now() {
-        let now = fuin_core::now_unix();
+        let now = domi_core::now_unix();
         assert_eq!(relative_time(now), "just now");
         assert_eq!(relative_time(now - 120), "2m ago");
         assert_eq!(relative_time(now - 7200), "2h ago");
@@ -179,7 +180,7 @@ mod tests {
     #[test]
     fn relative_time_tolerates_future_timestamps() {
         // Clock skew or a bad import shouldn't produce nonsense like "-3m ago".
-        let now = fuin_core::now_unix();
+        let now = domi_core::now_unix();
         let out = relative_time(now + 500);
         assert_eq!(out, "just now");
     }

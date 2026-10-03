@@ -1,9 +1,9 @@
 //! On-disk vault storage.
 //!
-//! Layout (from the AUDIT.md blueprint, paths renamed to Fuin):
+//! Layout (from the AUDIT.md blueprint, paths renamed to Domi):
 //!
 //! ```text
-//! ~/.local/share/fuin/vault/
+//! ~/.local/share/domi/vault/
 //! ├── manifest.json      # VaultManifest as JSON — not secret
 //! ├── index.enc          # encrypted Index blob
 //! └── entries/{uuid}.enc # one encrypted Entry per file
@@ -16,7 +16,7 @@
 //!
 //! 1. **No plaintext secrets on disk.** Only `manifest.json` is written in the
 //!    clear, and it holds nothing but the KDF salt and parameters. Entries and
-//!    the index are written as the encrypted blobs `fuin-core` produces.
+//!    the index are written as the encrypted blobs `domi-core` produces.
 //! 2. **Atomic-ish writes.** An entry is written to a temp file then renamed, so
 //!    a crash mid-save can't leave a half-written `.enc` that fails to decrypt
 //!    forever.
@@ -25,7 +25,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use fuin_core::{Entry, Index, KdfParams, Vault, VaultManifest};
+use domi_core::{Entry, Index, KdfParams, Vault, VaultManifest};
 
 use crate::error::AppError;
 
@@ -54,20 +54,27 @@ impl VaultPaths {
 
     /// The platform-appropriate default location.
     ///
-    /// `FUIN_VAULT_DIR` overrides it, which is what the tests use so they never
-    /// touch a real vault.
+    /// `DOMI_VAULT_DIR` overrides it, which lets a user point the TUI at a
+    /// specific vault.
     pub fn default_location() -> Self {
-        if let Ok(custom) = std::env::var("FUIN_VAULT_DIR") {
-            if !custom.is_empty() {
-                return VaultPaths::new(custom);
-            }
+        Self::default_location_from(std::env::var("DOMI_VAULT_DIR").ok())
+    }
+
+    /// The same lookup, with the override supplied directly.
+    ///
+    /// The env var is process-global, so tests pass the value as an argument
+    /// instead of calling `set_var` — otherwise two tests touching it on
+    /// parallel threads race and intermittently clobber each other.
+    fn default_location_from(override_dir: Option<String>) -> Self {
+        if let Some(custom) = override_dir.filter(|c| !c.is_empty()) {
+            return VaultPaths::new(custom);
         }
-        let base = directories::ProjectDirs::from("", "", "fuin")
+        let base = directories::ProjectDirs::from("", "", "domi")
             .map(|d| d.data_dir().to_path_buf())
             .unwrap_or_else(|| {
                 // Fall back to a relative dir rather than panicking; the error
                 // surfaces later as a normal storage failure the user sees.
-                PathBuf::from(".fuin")
+                PathBuf::from(".domi")
             });
         VaultPaths::new(base.join("vault"))
     }
@@ -249,7 +256,7 @@ impl VaultSession {
             let id = match existing {
                 Some(tag) => tag.id.clone(),
                 None => {
-                    let tag = fuin_core::create_tag(
+                    let tag = domi_core::create_tag(
                         &mut self.index,
                         new_tag_id(now),
                         name,
@@ -293,7 +300,7 @@ impl VaultSession {
     pub fn delete_entry(&mut self, id: &str) -> Result<(), AppError> {
         let mut entry = self.load_entry(id)?;
         entry.deleted = true;
-        entry.updated_at = fuin_core::now_unix();
+        entry.updated_at = domi_core::now_unix();
         self.save_entry(entry)
     }
 
@@ -337,7 +344,7 @@ impl VaultSession {
     /// The index itself keeps deleted entries so a delete can be undone by
     /// hand; callers that mean "what the user has" want this.
     #[cfg(test)]
-    pub fn visible_entries(&self) -> Vec<&fuin_core::IndexEntry> {
+    pub fn visible_entries(&self) -> Vec<&domi_core::IndexEntry> {
         self.index.entries.iter().filter(|e| !e.deleted).collect()
     }
 
@@ -365,7 +372,7 @@ pub(crate) mod testing {
     impl TempVault {
         pub fn new() -> Self {
             let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let p = std::env::temp_dir().join(format!("fuin-test-{}-{}", std::process::id(), n));
+            let p = std::env::temp_dir().join(format!("domi-test-{}-{}", std::process::id(), n));
             let _ = fs::remove_dir_all(&p);
             TempVault(p)
         }
@@ -604,18 +611,22 @@ mod tests {
     #[test]
     fn default_location_honours_the_env_override() {
         // Lets a user point the TUI at a specific vault for testing.
-        std::env::set_var("FUIN_VAULT_DIR", "/tmp/fuin-override-check");
-        let p = VaultPaths::default_location();
-        std::env::remove_var("FUIN_VAULT_DIR");
-        assert_eq!(p.root(), Path::new("/tmp/fuin-override-check"));
+        let p = VaultPaths::default_location_from(Some("/tmp/domi-override-check".into()));
+        assert_eq!(p.root(), Path::new("/tmp/domi-override-check"));
     }
 
     #[test]
-    fn default_location_is_absolute_and_mentions_fuin() {
-        std::env::remove_var("FUIN_VAULT_DIR");
-        let p = VaultPaths::default_location();
+    fn an_empty_override_falls_back_to_the_platform_default() {
+        let empty = VaultPaths::default_location_from(Some(String::new()));
+        let none = VaultPaths::default_location_from(None);
+        assert_eq!(empty.root(), none.root());
+    }
+
+    #[test]
+    fn default_location_is_absolute_and_mentions_domi() {
+        let p = VaultPaths::default_location_from(None);
         let s = p.root().to_string_lossy().to_string();
-        assert!(s.contains("fuin"), "default path should be Fuin-scoped: {s}");
+        assert!(s.contains("domi"), "default path should be Domi-scoped: {s}");
     }
 
     #[test]

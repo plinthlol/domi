@@ -1,5 +1,5 @@
 use base64::Engine;
-use fuin_core::{
+use domi_core::{
     assign_tag, check_strength, create_collection, create_tag, delete_collection, delete_tag,
     build_auth_url, build_token_exchange_request, generate_oauth_state,
     generate_password, generate_pkce, generate_totp, list_children,
@@ -73,7 +73,7 @@ fn parse_alias_provider(provider: &str) -> Result<AliasProviderKind, String> {
 // linear memory as a JS-visible value: JS only ever sees an opaque u64
 // handle. This replaces the previous design where wasm_create_vault/
 // wasm_unlock_vault derived the key a second time and returned it as a
-// base64 String — see AUDIT.md §1 / FUIN_AUDIT_FINDINGS.md [HIGH].
+// base64 String — see AUDIT.md §1 / DOMI_AUDIT_FINDINGS.md [HIGH].
 // Call wasm_lock_vault to drop a handle's entry and zeroize its key.
 
 fn vaults() -> &'static Mutex<HashMap<u64, Vault>> {
@@ -410,7 +410,7 @@ pub fn wasm_build_token_exchange_request(token_url: &str, client_id: &str, code:
 #[wasm_bindgen]
 pub fn wasm_parse_token_response(response_b64: &str, current_unix_time: i64) -> String {
     let bytes = match BASE64.decode(response_b64) { Ok(b) => b, Err(e) => return err_json(format!("invalid base64 response: {e}")) };
-    match fuin_core::parse_token_response(&bytes, current_unix_time) { Ok(t) => ok_json(t), Err(e) => err_json(e) }
+    match domi_core::parse_token_response(&bytes, current_unix_time) { Ok(t) => ok_json(t), Err(e) => err_json(e) }
 }
 
 #[wasm_bindgen]
@@ -450,14 +450,14 @@ pub fn wasm_sync_pending_apply(pending_json: &str, operation: &str, id: &str) ->
 }
 
 #[wasm_bindgen]
-pub fn wasm_sync_retry_backoff(attempt: u32) -> u64 { fuin_core::retry_backoff_seconds(attempt) }
+pub fn wasm_sync_retry_backoff(attempt: u32) -> u64 { domi_core::retry_backoff_seconds(attempt) }
 
 #[wasm_bindgen]
 pub fn wasm_sync_resolve_conflict(local_json: &str, remote_json: &str, strategy: &str) -> String {
     let local = match serde_json::from_str(local_json) { Ok(v) => v, Err(e) => return err_json(format!("invalid local entry: {e}")) };
     let remote = match serde_json::from_str(remote_json) { Ok(v) => v, Err(e) => return err_json(format!("invalid remote entry: {e}")) };
     let strategy = match strategy { "local" => ConflictStrategy::KeepLocal, "remote" => ConflictStrategy::KeepRemote, "newest" => ConflictStrategy::KeepNewest, other => return err_json(format!("unknown conflict strategy: {other}")) };
-    ok_json(fuin_core::resolve_conflict(&local, &remote, strategy))
+    ok_json(domi_core::resolve_conflict(&local, &remote, strategy))
 }
 
 // ---------------------------------------------------------------------------
@@ -466,7 +466,7 @@ pub fn wasm_sync_resolve_conflict(local_json: &str, remote_json: &str, strategy:
 
 #[derive(Serialize)]
 struct TagOutput {
-    tag: fuin_core::Tag,
+    tag: domi_core::Tag,
     index: Index,
 }
 
@@ -568,7 +568,7 @@ pub fn wasm_entry_remove_tag(entry_json: &str, tag_id: &str) -> String {
 
 #[derive(Serialize)]
 struct CollectionOutput {
-    collection: fuin_core::Collection,
+    collection: domi_core::Collection,
     index: Index,
 }
 
@@ -845,7 +845,7 @@ pub fn wasm_entry_get_password_history(entry_json: &str) -> String {
         Ok(e) => e,
         Err(e) => return err_json(e),
     };
-    let history = fuin_core::get_password_history(&entry);
+    let history = domi_core::get_password_history(&entry);
     ok_json(history)
 }
 
@@ -855,7 +855,7 @@ pub fn wasm_entry_get_password_history(entry_json: &str) -> String {
 
 #[wasm_bindgen]
 pub fn wasm_vault_encrypt_attachment(handle: u64, attachment_json: &str, entry_id: &str) -> String {
-    let attachment: fuin_core::Attachment = match serde_json::from_str(attachment_json) {
+    let attachment: domi_core::Attachment = match serde_json::from_str(attachment_json) {
         Ok(a) => a,
         Err(e) => return err_json(format!("invalid attachment json: {e}")),
     };

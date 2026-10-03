@@ -6,13 +6,13 @@
 //! behaviour — filter remapping, form validation, auto-lock — be unit tested
 //! without a terminal.
 //!
-//! Filtering delegates to [`fuin_core::search::SearchCache`] rather than
+//! Filtering delegates to [`domi_core::search::SearchCache`] rather than
 //! reimplementing matching here, so the TUI and the other shells agree on what
 //! a search for "git" means.
 
-use fuin_core::search::SearchCache;
-use fuin_core::vault::{Entry, IndexEntry, ItemCategory};
-use fuin_core::{KdfParams, now_unix};
+use domi_core::search::SearchCache;
+use domi_core::vault::{Entry, IndexEntry, ItemCategory};
+use domi_core::{KdfParams, now_unix};
 use zeroize::Zeroize;
 
 use crate::error::AppError;
@@ -67,7 +67,7 @@ pub enum Filter {
     All,
     Favorites,
     /// One tag, held as its id because that is what
-    /// [`fuin_core::search::SearchCache::query_by_tag`] matches on. The name
+    /// [`domi_core::search::SearchCache::query_by_tag`] matches on. The name
     /// is looked up from the index for display; see [`Filter::label`].
     Tag { id: String, name: String },
 }
@@ -189,13 +189,13 @@ impl GeneratorOptions {
     /// password with no character classes (core treats that as a length-valid
     /// but useless password).
     pub fn validate(&self) -> Result<(), String> {
-        if !(fuin_core::password::MIN_PASSWORD_LENGTH..=fuin_core::password::MAX_PASSWORD_LENGTH)
+        if !(domi_core::password::MIN_PASSWORD_LENGTH..=domi_core::password::MAX_PASSWORD_LENGTH)
             .contains(&self.length)
         {
             return Err(format!(
                 "Length must be between {} and {}.",
-                fuin_core::password::MIN_PASSWORD_LENGTH,
-                fuin_core::password::MAX_PASSWORD_LENGTH
+                domi_core::password::MIN_PASSWORD_LENGTH,
+                domi_core::password::MAX_PASSWORD_LENGTH
             ));
         }
         if !(self.uppercase || self.lowercase || self.numbers || self.symbols) {
@@ -206,7 +206,7 @@ impl GeneratorOptions {
 
     pub fn generate(&self) -> Result<String, AppError> {
         self.validate().map_err(AppError::BadInput)?;
-        fuin_core::generate_password(
+        domi_core::generate_password(
             self.length,
             self.uppercase,
             self.lowercase,
@@ -594,7 +594,7 @@ impl AppState {
     fn recompute_rows(&mut self) {
         let previous = self.selected_id();
 
-        let mut items: Vec<&fuin_core::search::SearchItem> = match &self.filter {
+        let mut items: Vec<&domi_core::search::SearchItem> = match &self.filter {
             Filter::All => self.cache.query(&self.query),
             // The filter narrows first, then the query narrows within it, so
             // "search inside favorites" behaves the way it reads.
@@ -1310,13 +1310,18 @@ fn new_entry_id() -> String {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id() as u64;
+
+    // `{:04x}` and `{:012x}` are *minimum* widths, not caps, so a pid above
+    // 0xffff or a counter above 2^48 would widen the id past 32 characters.
+    // Callers assume the fixed width, so truncate rather than pad.
+    let pid = (std::process::id() as u64) & 0xffff;
+    let seq = seq & ((1u64 << 48) - 1);
 
     format!("{nanos:016x}{pid:04x}{seq:012x}")
 }
 
 /// Case-insensitive substring match across the fields core searches.
-fn matches_query(item: &fuin_core::search::SearchItem, query: &str) -> bool {
+fn matches_query(item: &domi_core::search::SearchItem, query: &str) -> bool {
     if query.trim().is_empty() {
         return true;
     }
@@ -1329,7 +1334,7 @@ fn matches_query(item: &fuin_core::search::SearchItem, query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuin_core::vault::Index;
+    use domi_core::vault::Index;
 
     fn idx_entry(id: &str, title: &str, username: &str, updated_at: i64) -> IndexEntry {
         IndexEntry {
@@ -1349,7 +1354,7 @@ mod tests {
 
     fn state_with(entries: Vec<IndexEntry>) -> AppState {
         let dir = std::env::temp_dir().join(format!(
-            "fuin-state-{}-{:?}",
+            "domi-state-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -1360,7 +1365,7 @@ mod tests {
         let mut session = session;
         session.index = Index { version: 1, entries, ..Default::default() };
 
-        let mut s = AppState::new(VaultPaths::new("/tmp/fuin-state-unused"));
+        let mut s = AppState::new(VaultPaths::new("/tmp/domi-state-unused"));
         s.session = Some(session);
         s
     }
@@ -1625,14 +1630,14 @@ mod tests {
 
     #[test]
     fn initial_screen_depends_on_whether_a_vault_exists() {
-        let existing = std::env::temp_dir().join("fuin-state-test-exists");
+        let existing = std::env::temp_dir().join("domi-state-test-exists");
         let _ = std::fs::create_dir_all(&existing);
         std::fs::write(existing.join("manifest.json"), "{}").unwrap();
 
         let mut s = AppState::new(VaultPaths::new(&existing));
         assert_eq!(s.initial_screen(), Screen::Unlock);
 
-        let mut missing = AppState::new(VaultPaths::new("/tmp/fuin-state-missing-dir"));
+        let mut missing = AppState::new(VaultPaths::new("/tmp/domi-state-missing-dir"));
         assert_eq!(missing.initial_screen(), Screen::Setup);
 
         let _ = std::fs::remove_dir_all(&existing);
@@ -1753,7 +1758,7 @@ mod tests {
         let mut s = state_with(vec![idx_entry("a", "Alpha", "u", 2)]);
         // Entries carry tag *ids*, so the index needs a tag for the id to
         // resolve to. This is the shape `save_form` produces.
-        s.session.as_mut().unwrap().index.tags = vec![fuin_core::vault::Tag {
+        s.session.as_mut().unwrap().index.tags = vec![domi_core::vault::Tag {
             id: "t-work".into(),
             name: "work".into(),
             updated_at: 0,
@@ -2136,7 +2141,7 @@ mod tests {
 
     /// A state pointed at a fresh, empty temp vault.
     fn fresh_state() -> AppState {
-        let dir = std::env::temp_dir().join(format!("fuin-act-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let dir = std::env::temp_dir().join(format!("domi-act-{}-{:?}", std::process::id(), std::thread::current().id()));
         let _ = std::fs::remove_dir_all(&dir);
         AppState::new(VaultPaths::new(&dir))
     }

@@ -10,7 +10,7 @@
 //! fields inline, so a binding reads as "up arrow moves the selection" rather
 //! than a diff.
 
-use fuin_core::password::MAX_PASSWORD_LENGTH;
+use domi_core::password::MAX_PASSWORD_LENGTH;
 use iocraft::prelude::KeyCode;
 
 use crate::state::{AppState, Field, Focus, Modal, Screen, Status};
@@ -297,10 +297,10 @@ fn handle_modal_key(
     ctrl: bool,
 ) -> Action {
     use KeyCode as C;
-    if ctrl {
-        if let C::Char('c') = code {
-            return Action::Quit;
-        }
+    if ctrl
+        && let C::Char('c') = code
+    {
+        return Action::Quit;
     }
     // Every modal closes on Escape or Ctrl+C; nothing beneath it reacts.
     if code == C::Esc {
@@ -466,7 +466,7 @@ mod tests {
     use KeyCode as C;
 
     fn state_with_screen(screen: Screen) -> AppState {
-        let mut s = AppState::new(crate::vault_store::VaultPaths::new("/tmp/fuin-keys"));
+        let mut s = AppState::new(crate::vault_store::VaultPaths::new("/tmp/domi-keys"));
         s.screen = screen;
         s
     }
@@ -728,7 +728,7 @@ mod tests {
     fn the_password_field_caps_its_length_at_the_core_maximum() {
         // The cap is core's, imported rather than restated, so raising core's
         // limit cannot leave the UI rejecting a password core would accept.
-        assert_eq!(MAX_PASSWORD_LENGTH, fuin_core::password::MAX_PASSWORD_LENGTH);
+        assert_eq!(MAX_PASSWORD_LENGTH, domi_core::password::MAX_PASSWORD_LENGTH);
         let mut s = state_with_screen(Screen::Unlock);
         for _ in 0..(MAX_PASSWORD_LENGTH + 10) {
             press(&mut s, C::Char('x'));

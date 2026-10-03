@@ -1,16 +1,16 @@
 [package]
-name = "fuin-tui"
+name = "domi-tui"
 version = "0.1.0"
-edition = "2021"
-description = "Terminal UI shell for Fuin, built on iocraft."
+edition = "2024"
+description = "Terminal UI shell for Domi, built on iocraft."
 license = "MIT OR Apache-2.0"
 
 [[bin]]
-name = "fuin"
+name = "domish"
 path = "src/main.rs"
 
 [dependencies]
-fuin-core = { path = "../core" }
+domi-core = { path = "../core" }
 iocraft = "0.9.1"
 smol = "2"
 serde = { version = "1", features = ["derive"] }

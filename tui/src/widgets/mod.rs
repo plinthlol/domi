@@ -1,4 +1,4 @@
-//! Custom widgets for the Fuin TUI.
+//! Custom widgets for the Domi TUI.
 //!
 //! iocraft ships a minimal component set — a `View`, some `Text`, a
 //! `TextInput`, a `Button`, and a `ScrollView` — and no layout primitives like

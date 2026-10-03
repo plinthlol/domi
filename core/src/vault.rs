@@ -329,14 +329,13 @@ impl Vault {
                     return Err(CoreError::NotFound(format!("tag {tag_id}")));
                 }
             }
-            if let Some(collection_id) = &entry.collection_id {
-                if !index
+            if let Some(collection_id) = &entry.collection_id
+                && !index
                     .collections
                     .iter()
                     .any(|collection| collection.id == *collection_id && !collection.deleted)
-                {
-                    return Err(CoreError::NotFound(format!("collection {collection_id}")));
-                }
+            {
+                return Err(CoreError::NotFound(format!("collection {collection_id}")));
             }
         }
         let entry_id = entry.id.clone();

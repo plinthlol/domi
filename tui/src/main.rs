@@ -1,4 +1,4 @@
-//! Fuin — a terminal password manager.
+//! Domi — a terminal password manager.
 //!
 //! The shell is three layers, each testable on its own:
 //!
@@ -53,30 +53,28 @@ async fn run() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The vault location, honouring `--vault DIR` and the `FUIN_VAULT_DIR`
-/// environment variable.
+/// How the program names itself in usage and error output.
+///
+/// Read from the compiled-in bin name rather than repeated, so renaming the
+/// binary in Cargo.toml updates every message at once.
+const BIN_NAME: &str = env!("CARGO_BIN_NAME");
+
+/// The vault location, honouring the `DOMI_VAULT_DIR` environment variable.
 fn vault_path_from_args() -> VaultPaths {
     let mut args = std::env::args().skip(1);
     // Every arm below returns or exits, so exactly one argument is read.
     if let Some(arg) = args.next() {
         match arg.as_str() {
-            "--vault" | "-v" => match args.next() {
-                Some(dir) => return VaultPaths::new(dir),
-                None => {
-                    eprintln!("fuin: --vault needs a directory");
-                    std::process::exit(2);
-                }
-            },
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
             }
             "--version" | "-V" => {
-                println!("fuin {}", env!("CARGO_PKG_VERSION"));
+                println!("{BIN_NAME} {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             other => {
-                eprintln!("fuin: unknown argument: {other}");
+                eprintln!("{BIN_NAME}: unknown argument: {other}");
                 print_help();
                 std::process::exit(2);
             }
@@ -88,9 +86,8 @@ fn vault_path_from_args() -> VaultPaths {
 /// The `--help` text, kept as a constant so the tests can assert on it
 /// without capturing stdout.
 const HELP: &str = "\
-Usage: fuin [--vault DIR]
+Usage: domish
 
-  -v, --vault DIR  use this vault instead of the default location
   -h, --help       show this message
   -V, --version    show the version
 
@@ -107,7 +104,7 @@ Keys:
 ";
 
 fn print_help() {
-    println!("fuin {}\n\n{HELP}", env!("CARGO_PKG_VERSION"));
+    println!("{BIN_NAME} {}\n\n{HELP}", env!("CARGO_PKG_VERSION"));
 }
 
 #[cfg(test)]
@@ -128,8 +125,16 @@ mod tests {
 
     #[test]
     fn help_mentions_every_flag_it_accepts() {
-        for flag in ["--vault", "-v", "--help", "-h", "--version", "-V"] {
+        for flag in ["--help", "-h", "--version", "-V"] {
             assert!(HELP.contains(flag), "{flag} is accepted but undocumented");
+        }
+    }
+
+    #[test]
+    fn help_does_not_advertise_the_removed_vault_flag() {
+        // The vault location now comes from DOMI_VAULT_DIR alone.
+        for gone in ["--vault", "-v, --vault"] {
+            assert!(!HELP.contains(gone), "{gone} was removed but is still documented");
         }
     }
 

@@ -1,0 +1,7 @@
+# Use mold for linking: it is measurably faster than GNU ld and is the
+# default linker on Arch's gcc since it ships /usr/sbin/ld.mold.
+#
+# Applies to the host target only. Cross targets (iOS, Android, Windows,
+# wasm) need their own SDK linkers, so they are deliberately not listed.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

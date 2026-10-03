@@ -7,7 +7,7 @@
 //!
 //! Every `CoreError` maps to a short sentence a user can act on. Nothing else.
 
-use fuin_core::CoreError;
+use domi_core::CoreError;
 
 /// What went wrong, phrased for someone looking at a password manager.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +40,7 @@ impl AppError {
             AppError::NoVault => "No vault found at this location.".to_string(),
             AppError::MissingReference(what) => format!("Referenced {what} no longer exists."),
             AppError::TooNew(v) => {
-                format!("This vault was written by a newer version of Fuin (format {v}).")
+                format!("This vault was written by a newer version of Domi (format {v}).")
             }
             AppError::AlreadyTaken(what) => format!("That {what} is already in use."),
             AppError::BadInput(what) => what.clone(),
