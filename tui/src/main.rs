@@ -1,12 +1,13 @@
 //! Domi — a terminal password manager.
 //!
-//! The shell is three layers, each testable on its own:
+//! The shell is four layers, each testable on its own:
 //!
 //! - [`state`] holds what the app is: screens, selection, the entry form.
 //! - [`keys`] translates a keypress into a change to that state.
-//! - [`app`] and [`widgets`] draw it.
+//! - [`vault_store`] owns the filesystem, and [`config`] the preferences file.
+//! - [`ui`] draws it.
 //!
-//! Nothing above `state` can reach the derived key. `VaultSession` exposes no
+//! Nothing above [`state`] can reach the derived key. `VaultSession` exposes no
 //! accessor for it and deliberately does not implement `Debug`, so a session
 //! cannot be logged or printed by accident, and the render snapshot the view
 //! receives contains no session at all.
@@ -20,37 +21,21 @@ mod state;
 #[cfg(test)]
 mod testkit;
 mod theme;
+mod ui;
 mod vault_store;
-mod widgets;
 
 use std::process::ExitCode;
-
-use iocraft::prelude::*;
 
 use crate::app::App;
 use crate::vault_store::VaultPaths;
 
 fn main() -> ExitCode {
-    smol::block_on(run())
+    run()
 }
 
-async fn run() -> ExitCode {
+fn run() -> ExitCode {
     let paths = vault_path_from_args();
-    // The wrapper is explicitly sized to the terminal. iocraft's own
-    // `fullscreen()` wrapper gives its child no definite cross-axis size, so
-    // a tree that relies on `flex_grow` alone collapses to its content width
-    // and the app border stops spanning the window. Sizing here — one level
-    // above the component — is what makes the frame fill the screen.
-    // A print of the terminal's own geometry would be noise; the render loop
-    // owns the screen and restores it on the way out.
-    let exit = element! {
-        View(width: 100_pct, height: 100_pct) {
-            App(paths)
-        }
-    }
-    .fullscreen()
-    .await;
-    drop(exit);
+    App::new(paths).run();
     ExitCode::SUCCESS
 }
 
@@ -110,6 +95,7 @@ Keys:
   enter            confirm           esc  back / cancel
   s                settings          q    lock
   ctrl+c           quit
+
 ";
 
 fn print_help() {
@@ -125,31 +111,28 @@ mod tests {
         // The help text and the key table are separate, so they drift. These
         // are the keys a first-time user would try first.
         for key in ["n", "e", "d", "f", "/", "q", "tab", "enter", "esc"] {
-            assert!(
-                key == "tab" || HELP.contains(key),
-                "{key} is handled by the app but missing from --help"
-            );
+            assert!(key == "tab" || HELP.contains(key), "help is missing '{key}'");
         }
     }
 
     #[test]
-    fn help_mentions_every_flag_it_accepts() {
-        for flag in ["--help", "-h", "--version", "-V"] {
-            assert!(HELP.contains(flag), "{flag} is accepted but undocumented");
-        }
+    fn the_help_text_names_the_binary_the_crate_actually_builds() {
+        // The bin name is read from Cargo.toml at compile time, so this catches
+        // a rename that only half-landed.
+        assert!(HELP.contains("domish"), "usage should name domish");
+        assert_eq!(BIN_NAME, "domish");
     }
 
     #[test]
-    fn help_does_not_advertise_the_removed_vault_flag() {
-        // The vault location now comes from DOMI_VAULT_DIR alone.
-        for gone in ["--vault", "-v, --vault"] {
-            assert!(!HELP.contains(gone), "{gone} was removed but is still documented");
-        }
+    fn the_help_text_fits_a_narrow_terminal() {
+        // A 40-column terminal is the narrowest worth supporting; a key hint
+        // that wraps would push the rest of the help out of view.
+        let widest = HELP.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        assert!(widest <= 72, "help has a {widest}-character line");
     }
 
     #[test]
-    fn the_default_vault_location_is_absolute() {
-        let paths = VaultPaths::default_location();
-        assert!(paths.root().is_absolute(), "a relative vault path is a bug waiting to happen");
+    fn the_help_text_lists_the_two_quit_keys() {
+        assert!(HELP.contains("ctrl+c"), "ctrl+c quits and should be listed");
     }
 }

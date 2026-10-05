@@ -1,187 +1,176 @@
-//! Visual constants.
+//! The app's colours, in one place.
 //!
-//! One place for every colour, border, and spacing decision, so the TUI reads
-//! as one design system instead of a pile of ad-hoc choices.
+//! Kept apart from the widgets that use them so a theme change is one edit and
+//! so the palette can be checked for contrast without rendering anything.
 //!
-//! Palette discipline: cyan is the only accent, grey is structure, red appears
-//! *only* on destructive actions. Nothing else gets a colour, which is what
-//! keeps a dense two-pane screen readable.
+//! Colours are plain constants rather than a themed trait because the app
+//! ships one theme. The trade is deliberate: indirection would cost a
+//! parameter on every widget draw to support a second palette nobody asked
+//! for, and the constants keep each draw site readable.
 
-use iocraft::prelude::*;
+use ratatui::style::{Color, Modifier, Style};
 
-/// Accent for the focused element and the current selection.
+/// The accent: titles, the focused pane's border, selection.
 pub const ACCENT: Color = Color::Cyan;
 
-/// Panel borders and dividers.
-pub const BORDER: Color = Color::Grey;
+/// Ordinary borders.
+pub const PANEL_BORDER: Color = Color::DarkGray;
 
-/// Destructive actions only (delete, discard).
+/// De-emphasised text: hints, placeholders, counts.
+pub const MUTED: Color = Color::DarkGray;
+
+/// Destructive actions and errors.
 pub const DANGER: Color = Color::Red;
 
-/// Muted text: placeholders, hints, timestamps.
-pub const MUTED: Color = Color::Grey;
-
-/// Positive confirmation (saved, copied).
+/// Confirmations and other good news.
 pub const SUCCESS: Color = Color::Green;
 
-/// Panel outline.
-pub const PANEL_BORDER: BorderStyle = BorderStyle::Round;
+/// A secret that is currently revealed.
+pub const SECRET: Color = Color::Yellow;
 
+/// Body text.
+pub const TEXT: Color = Color::Gray;
 
-/// The outer app frame.
-pub const APP_BORDER: BorderStyle = BorderStyle::Single;
+/// The focused row's background, kept dark so text stays readable.
+pub const SELECTION_BG: Color = Color::Rgb(30, 50, 60);
 
-/// Standard interior padding.
-pub const PAD: u32 = 1;
+/// Text on top of [`SELECTION_BG`].
+pub const SELECTION_FG: Color = Color::White;
 
-/// Gap between the two panes.
-pub const PANE_GAP: u32 = 1;
+/// A pane border that has focus.
+pub const BORDER_FOCUS: Style = Style::new().fg(ACCENT);
 
-/// Below this width the two-pane layout gets too cramped, so the UI stacks into
-/// one pane instead of shrinking both to uselessness.
-pub const TWO_PANE_MIN_WIDTH: u16 = 80;
+/// A pane border without focus.
+pub const BORDER_IDLE: Style = Style::new().fg(PANEL_BORDER);
 
-/// Left pane width when side-by-side, as a percentage of the terminal.
-pub const LIST_PANE_PCT: f32 = 34.0;
-
-/// Width of the tab stop in the help line.
-pub const HELP_COL: Color = MUTED;
-
-/// The masked character for hidden secrets.
-pub const MASK: char = '•';
-
-/// Strength meter colour for a 0–100 score.
-pub fn strength_color(score: u8) -> Color {
-    match score {
-        0..=29 => Color::Red,
-        30..=59 => Color::Yellow,
-        60..=79 => Color::Cyan,
-        _ => Color::Green,
-    }
+/// The selected row.
+pub fn selected() -> Style {
+    Style::default().bg(SELECTION_BG).fg(SELECTION_FG).add_modifier(Modifier::BOLD)
 }
 
-/// A short word for a strength score, for the meter label.
-pub fn strength_label(score: u8) -> &'static str {
-    match score {
-        0..=29 => "weak",
-        30..=59 => "fair",
-        60..=79 => "good",
-        _ => "strong",
-    }
+/// A row the mouse or keyboard is not on.
+pub fn row() -> Style {
+    Style::default().fg(TEXT)
 }
 
-/// Renders a secret as fixed-width dots, so its length doesn't leak its
-/// content but the field still looks filled in.
-pub fn mask(secret: &str) -> String {
-    MASK.to_string().repeat(secret.chars().count())
+/// A screen title.
+pub fn title() -> Style {
+    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
 }
 
-/// Formats a Unix timestamp as a short local-agnostic string.
-///
-/// Deliberately avoids a date crate: the TUI only needs a rough relative age
-/// ("3d ago"), which is computable from the current time with no formatting
-/// machinery.
-pub fn relative_time(unix_secs: i64) -> String {
-    let now = domi_core::now_unix();
-    let delta = now - unix_secs;
-    if delta < 60 {
-        "just now".to_string()
-    } else if delta < 3600 {
-        format!("{}m ago", delta / 60)
-    } else if delta < 86_400 {
-        format!("{}h ago", delta / 3600)
-    } else if delta < 30 * 86_400 {
-        format!("{}d ago", delta / 86_400)
-    } else {
-        format!("{}mo ago", delta / (30 * 86_400))
-    }
+/// Ordinary body text.
+pub fn body() -> Style {
+    Style::default().fg(TEXT)
 }
 
-/// Truncates to `max` display columns, appending an ellipsis when cut.
-///
-/// Used everywhere a user-supplied string meets a fixed-width panel, so a long
-/// title can't smear into the neighbouring pane.
-pub fn truncate(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    if max <= 1 {
-        return "…".to_string();
-    }
-    let kept: String = text.chars().take(max - 1).collect();
-    format!("{kept}…")
+/// A hint or other secondary text.
+pub fn muted() -> Style {
+    Style::default().fg(MUTED)
+}
+
+/// A destructive action.
+pub fn danger() -> Style {
+    Style::default().fg(DANGER).add_modifier(Modifier::BOLD)
+}
+
+/// A successful action.
+pub fn success() -> Style {
+    Style::default().fg(SUCCESS)
+}
+
+/// A revealed secret.
+pub fn secret() -> Style {
+    Style::default().fg(SECRET)
+}
+
+/// A field the user is typing in.
+pub fn focused_field() -> Style {
+    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+}
+
+/// The text caret shown in whichever field is taking input.
+pub fn accent() -> Style {
+    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The relative luminance of a colour, per WCAG.
+    fn luminance(c: Color) -> f64 {
+        let (r, g, b) = match c {
+            Color::Rgb(r, g, b) => (r as f64, g as f64, b as f64),
+            // The named colours are the 16 ANSI values on a 0-255 scale.
+            Color::Black => (0.0, 0.0, 0.0),
+            Color::Red => (205.0, 0.0, 0.0),
+            Color::Green => (0.0, 205.0, 0.0),
+            Color::Yellow => (205.0, 205.0, 0.0),
+            Color::Blue => (0.0, 0.0, 238.0),
+            Color::Magenta => (205.0, 0.0, 205.0),
+            Color::Cyan => (0.0, 205.0, 205.0),
+            Color::Gray => (229.0, 229.0, 229.0),
+            Color::DarkGray => (127.0, 127.0, 127.0),
+            Color::LightRed => (255.0, 0.0, 0.0),
+            Color::LightGreen => (0.0, 255.0, 0.0),
+            Color::LightYellow => (255.0, 255.0, 0.0),
+            Color::LightBlue => (0.0, 0.0, 255.0),
+            Color::LightMagenta => (255.0, 0.0, 255.0),
+            Color::LightCyan => (0.0, 255.0, 255.0),
+            Color::White => (255.0, 255.0, 255.0),
+            _ => (127.0, 127.0, 127.0),
+        };
+        let f = |v: f64| {
+            let v = v / 255.0;
+            if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+    }
+
+    /// The WCAG contrast ratio between two colours, from 1.0 to 21.0.
+    fn contrast(a: Color, b: Color) -> f64 {
+        let (hi, lo) = {
+            let (x, y) = (luminance(a), luminance(b));
+            if x > y { (x, y) } else { (y, x) }
+        };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
     #[test]
-    fn mask_length_matches_secret_length() {
-        assert_eq!(mask("abc"), "•••");
-        assert_eq!(mask(""), "");
-        for secret in ["a longer pass phrase", "p@ss w0rd!", "🔐emoji secret🔐"] {
-            assert_eq!(mask(secret).chars().count(), secret.chars().count());
+    fn body_text_is_readable_against_the_selection_background() {
+        // The selected row is the one place two colours meet, and it is the
+        // row a user reads most, so this pair has to clear AA.
+        let ratio = contrast(SELECTION_FG, SELECTION_BG);
+        assert!(ratio >= 4.5, "selection contrast is only {ratio:.2}:1");
+    }
+
+    #[test]
+    fn every_foreground_is_readable_on_black() {
+        // The app never sets a light background, so black is the worst case.
+        for (name, colour) in [
+            ("text", TEXT),
+            ("muted", MUTED),
+            ("accent", ACCENT),
+            ("secret", SECRET),
+            ("danger", DANGER),
+            ("success", SUCCESS),
+        ] {
+            let ratio = contrast(colour, Color::Black);
+            assert!(ratio >= 3.0, "{name} on black is only {ratio:.2}:1");
         }
     }
 
     #[test]
-    fn mask_does_not_leak_content() {
-        let m = mask("hunter2");
-        assert!(!m.contains('h'));
-        assert!(!m.contains('7'));
+    fn muted_text_is_dimmer_than_body_text() {
+        // Muted is used for hints, so it must read as secondary rather than
+        // competing with the content.
+        assert!(luminance(MUTED) < luminance(TEXT), "hints should be dimmer");
     }
 
     #[test]
-    fn truncate_leaves_short_values_alone() {
-        assert_eq!(truncate("short", 10), "short");
-        assert_eq!(truncate("exactly-10", 10), "exactly-10");
-    }
-
-    #[test]
-    fn truncate_cuts_and_marks_with_ellipsis() {
-        assert_eq!(truncate("abcdefghij", 5), "abcd…");
-        assert_eq!(truncate("abcdefghij", 5).chars().count(), 5);
-    }
-
-    #[test]
-    fn truncate_handles_degenerate_widths() {
-        assert_eq!(truncate("abc", 1), "…");
-        assert_eq!(truncate("abc", 0), "…");
-    }
-
-    #[test]
-    fn truncate_counts_characters_not_bytes() {
-        // Multi-byte characters must not be split mid-sequence.
-        let out = truncate("héllo wörld", 5);
-        assert_eq!(out, "héll…");
-    }
-
-    #[test]
-    fn strength_labels_and_colors_cover_every_score() {
-        for score in [0u8, 1, 29, 30, 59, 60, 79, 80, 100] {
-            let _ = strength_color(score);
-            assert!(!strength_label(score).is_empty());
-        }
-        // Weak should read as danger, strong as success.
-        assert_eq!(strength_color(10), Color::Red);
-        assert_eq!(strength_color(95), Color::Green);
-    }
-
-    #[test]
-    fn relative_time_is_recent_for_now() {
-        let now = domi_core::now_unix();
-        assert_eq!(relative_time(now), "just now");
-        assert_eq!(relative_time(now - 120), "2m ago");
-        assert_eq!(relative_time(now - 7200), "2h ago");
-        assert_eq!(relative_time(now - 172_800), "2d ago");
-    }
-
-    #[test]
-    fn relative_time_tolerates_future_timestamps() {
-        // Clock skew or a bad import shouldn't produce nonsense like "-3m ago".
-        let now = domi_core::now_unix();
-        let out = relative_time(now + 500);
-        assert_eq!(out, "just now");
+    fn the_border_styles_are_distinguishable_from_each_other() {
+        assert_eq!(BORDER_FOCUS.fg, Some(ACCENT));
+        assert_eq!(BORDER_IDLE.fg, Some(PANEL_BORDER));
+        assert_ne!(BORDER_FOCUS.fg, BORDER_IDLE.fg, "focus must be visible");
     }
 }

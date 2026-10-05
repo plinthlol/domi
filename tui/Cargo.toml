@@ -2,7 +2,7 @@
 name = "domi-tui"
 version = "0.1.0"
 edition = "2024"
-description = "Terminal UI shell for Domi, built on iocraft."
+description = "Terminal UI shell for Domi, built on ratatui."
 license = "MIT OR Apache-2.0"
 
 [[bin]]
@@ -11,8 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 domi-core = { path = "../core" }
-iocraft = "0.9.1"
-smol = "2"
+ratatui = "0.29"
+crossterm = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
@@ -21,4 +21,3 @@ zeroize = "1.7"
 toml = "0.9"
 
 [dev-dependencies]
-futures = "0.3"

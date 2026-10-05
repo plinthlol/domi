@@ -1,10 +1,10 @@
-//! Screen and selection state for the whole TUI.
+//! Screen and selection state for the whole app.
 //!
-//! Deliberately free of iocraft: this file holds *what the app is* (which
-//! screen, which row is selected, what the form contains) while `app.rs` and
-//! `widgets/` hold how it looks. That split is what lets the interesting
-//! behaviour — filter remapping, form validation, auto-lock — be unit tested
-//! without a terminal.
+//! Deliberately free of any UI framework: this file holds *what the app is*
+//! (which screen, which row is selected, what the form contains) while `ui.rs`
+//! holds how it looks. That split is what lets the interesting behaviour —
+//! filter remapping, form validation, auto-lock — be unit tested without a
+//! terminal.
 //!
 //! Filtering delegates to [`domi_core::search::SearchCache`] rather than
 //! reimplementing matching here, so the TUI and the other shells agree on what
@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 
 use domi_core::search::SearchCache;
-use domi_core::vault::{Entry, IndexEntry, ItemCategory};
+use domi_core::vault::{Entry, ItemCategory};
 use domi_core::{KdfParams, now_unix};
 use zeroize::Zeroize;
 
@@ -21,29 +21,44 @@ use crate::config::Config;
 use crate::error::AppError;
 use crate::vault_store::{VaultPaths, VaultSession};
 
-/// The six screens from the product spec. `List` and `Detail` are one screen
-/// here: they are two panes of a single layout, and splitting them would mean
-/// the user navigates away from the list just to read an entry.
+/// The longest password a user can type, matching core's generator ceiling.
+///
+/// A password manager must not silently truncate a very long passphrase that
+/// came from elsewhere, so the limit is core's maximum rather than something
+/// shorter chosen for the UI.
+pub const MAX_PASSWORD_LENGTH: usize = domi_core::password::MAX_PASSWORD_LENGTH;
+
+/// The longest a title may be, in characters.
+pub const MAX_TITLE_LENGTH: usize = 200;
+
+/// The longest a note may be, in characters.
+pub const MAX_NOTES_LENGTH: usize = 10_000;
+
+/// The screens the app can be on.
+///
+/// `List` and `Detail` are one screen here: they are two panes of a single
+/// layout, and splitting them would mean the user navigates away from the list
+/// just to read an entry.
 ///
 /// Defaults to `Unlock` so a props struct can derive `Default`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Screen {
-    /// Create a vault: choose location, password, and KDF cost.
+    /// Create a vault: choose a password and confirm it.
     Setup,
     /// Unlock an existing vault. The default: almost every run starts here.
     #[default]
     Unlock,
-    /// The main two-pane screen: entry list plus entry detail.
+    /// The main list plus detail panes.
     Vault,
-    /// Create or edit one entry.
+    /// The entry editor.
     Edit,
-    /// KDF cost, master-password change, vault location.
+    /// Preferences.
     Settings,
 }
 
 impl Screen {
-    /// Every screen's title, for the header.
-    pub fn title(self) -> &'static str {
+    /// The short label the header shows on the left.
+    pub fn label(self) -> &'static str {
         match self {
             Screen::Setup => "Set up vault",
             Screen::Unlock => "Locked",
@@ -52,48 +67,65 @@ impl Screen {
             Screen::Settings => "Settings",
         }
     }
-
 }
 
-/// Which pane the keyboard is driving.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which pane has keyboard focus on the vault screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Focus {
+    /// The entry list.
+    #[default]
     List,
+    /// The detail pane.
     Detail,
-    /// The search box at the top of the list pane.
-    Search,
 }
 
-/// A saved slice of the list. `All` means no filtering.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Which entries the list is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Filter {
+    /// Everything.
+    #[default]
     All,
+    /// Favourites only.
     Favorites,
-    /// One tag, held as its id because that is what
-    /// [`domi_core::search::SearchCache::query_by_tag`] matches on. The name
-    /// is looked up from the index for display; see [`Filter::label`].
-    Tag { id: String, name: String },
 }
 
 impl Filter {
-    /// Short label for the status line, so the user can always see that a
-    /// filter is active and is looking at a subset of the vault.
-    pub fn label(&self) -> String {
+    /// The label shown in the header.
+    pub fn label(self) -> &'static str {
         match self {
-            Filter::All => "All".to_string(),
-            Filter::Favorites => "Favorites".to_string(),
-            Filter::Tag { name, .. } => format!("#{name}"),
+            Filter::All => "all",
+            Filter::Favorites => "favorites",
         }
     }
 
-    /// True when the list is showing a subset, which is the only case where
-    /// the UI needs an "empty" explanation.
-    pub fn is_narrowed(&self) -> bool {
-        !matches!(self, Filter::All)
+    /// The other filter, for the `v` key.
+    pub fn toggled(self) -> Self {
+        match self {
+            Filter::All => Filter::Favorites,
+            Filter::Favorites => Filter::All,
+        }
     }
 }
 
+/// What a confirmed dialog was asking permission for.
+///
+/// A confirm modal cannot do the work itself: it is a question, and the answer
+/// arrives as a later key press, by which point the dialog is gone. The action
+/// is parked here in between so `y` means "do that thing" and nothing else has
+/// to remember what "that thing" was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingAction {
+    /// Delete the entry that was selected when the dialog opened.
+    DeleteEntry,
+    /// Discard the vault's contents and return to setup with an empty vault.
+    ResetVault,
+}
+
 /// A modal dialog drawn over whatever screen is active.
+///
+/// A modal is an overlay rather than a new screen: it keeps the screen beneath
+/// it visible but unreachable, so every keybinding below it is disabled for as
+/// long as it is up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
     /// Yes/no. Destructive flows (delete, overwrite) land here.
@@ -102,63 +134,68 @@ pub enum Modal {
         body: String,
         danger: bool,
         yes_label: String,
+        /// The action `y` runs. `None` for a confirmation with nothing behind
+        /// it, which the UI treats as a plain message box.
+        action: Option<PendingAction>,
     },
     /// Password entry, used by the master-password change. The old password
     /// is not asked for: an unlocked session is already proof of it.
-    Password { title: String, value: String },
+    ///
+    /// The new password is confirmed against itself, because rekeying to a typo
+    /// locks the user out of every entry at once with no way back.
+    Password { title: String, value: String, confirm: String, confirm_active: bool },
     /// Free-text entry, used by the settings row that names a vault
-    /// directory. Separate from `Password` because the value is shown as it
-    /// is typed, and because a path needs its own confirmation label.
+    /// directory. Separate from `Password` because the value is shown as it is
+    /// typed, and because a path needs its own confirmation label.
     Text { title: String, value: String },
 }
 
-impl Modal {
-    #[cfg(test)]
-    pub fn confirm(title: &str, body: &str) -> Self {
+impl Modal {    /// A confirmation that runs `action` when the user answers yes.
+    pub fn ask(title: &str, body: &str, yes_label: &str, action: PendingAction) -> Self {
         Modal::Confirm {
             title: title.to_string(),
             body: body.to_string(),
-            danger: false,
-            yes_label: "Confirm".to_string(),
+            danger: matches!(action, PendingAction::DeleteEntry | PendingAction::ResetVault),
+            yes_label: yes_label.to_string(),
+            action: Some(action),
         }
-    }
-
-    /// A destructive confirmation. The UI tints this one red and spells the
-    /// action out, so a stray `y` can't destroy a vault.
-    pub fn danger(title: &str, body: &str) -> Self {
-        Modal::Confirm {
-            title: title.to_string(),
-            body: body.to_string(),
-            danger: true,
-            yes_label: "Delete".to_string(),
-        }
-    }
-
+    }    /// The dialog's title, used as its heading.
     pub fn title(&self) -> &str {
         match self {
-            Modal::Confirm { title, .. } | Modal::Password { title, .. } | Modal::Text { title, .. } => {
-                title
-            }
+            Modal::Confirm { title, .. }
+            | Modal::Password { title, .. }
+            | Modal::Text { title, .. } => title,
         }
     }
 
-    /// A modal that collects typed text rather than a yes/no answer.
-    ///
-    /// Shared by the password and free-text variants so the view can ask the
-    /// question without listing every variant again.
-    pub fn text_value(&self) -> Option<&str> {
+    /// The work a `y` answer triggers.
+    pub fn action(&self) -> Option<PendingAction> {
         match self {
-            Modal::Password { value, .. } | Modal::Text { value, .. } => Some(value),
-            Modal::Confirm { .. } => None,
+            Modal::Confirm { action, .. } => *action,
+            _ => None,
         }
     }
 
-    /// Appends a typed character to a text-entry modal.
+    /// Whether this dialog is tinted as destructive.
+    pub fn is_danger(&self) -> bool {
+        match self {
+            Modal::Confirm { danger, .. } => *danger,
+            _ => false,
+        }
+    }    /// A modal that collects typed text rather than a yes/no answer.    /// Which of a password modal's two fields is taking keystrokes.    /// Appends a typed character to a text-entry modal.
     ///
     /// Returns false for a confirm, which has no field to type into.
     pub fn push_char(&mut self, c: char) -> bool {
         match self {
-            Modal::Password { value, .. } | Modal::Text { value, .. } => {
+            Modal::Password { value, confirm, confirm_active, .. } => {
+                if *confirm_active {
+                    confirm.push(c)
+                } else {
+                    value.push(c)
+                }
+                true
+            }
+            Modal::Text { value, .. } => {
                 value.push(c);
                 true
             }
@@ -169,51 +206,55 @@ impl Modal {
     /// Deletes the last typed character, returning whether anything changed.
     pub fn pop_char(&mut self) -> bool {
         match self {
-            Modal::Password { value, .. } | Modal::Text { value, .. } => {
-                value.pop();
-                true
+            Modal::Password { value, confirm, confirm_active, .. } => {
+                let popped = if *confirm_active { confirm.pop() } else { value.pop() };
+                popped.is_some()
             }
+            Modal::Text { value, .. } => value.pop().is_some(),
             Modal::Confirm { .. } => false,
         }
     }
 
-    /// Modal dialogs take every keypress; nothing behind them is reachable.
-    #[cfg(test)]
-    pub fn blocks_input(&self) -> bool {
-        true
+    /// Moves a password modal between its two fields.
+    pub fn tab_field(&mut self) {
+        if let Modal::Password { confirm_active, .. } = self {
+            *confirm_active = !*confirm_active;
+        }
     }
+}
+
+/// How prominent a status message is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusKind {
+    /// Something worked.
+    Success,
+    /// Something was refused or failed.
+    Error,
+    /// Neutral information.
+    Info,
 }
 
 /// A transient message in the status line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
-    pub text: String,
     pub kind: StatusKind,
-    pub at: i64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatusKind {
-    Info,
-    Success,
-    Error,
+    pub text: String,
 }
 
 impl Status {
-    pub fn info(text: &str) -> Self {
-        Status { text: text.to_string(), kind: StatusKind::Info, at: now_unix() }
-    }
     pub fn success(text: &str) -> Self {
-        Status { text: text.to_string(), kind: StatusKind::Success, at: now_unix() }
+        Status { kind: StatusKind::Success, text: text.to_string() }
     }
     pub fn error(text: &str) -> Self {
-        Status { text: text.to_string(), kind: StatusKind::Error, at: now_unix() }
+        Status { kind: StatusKind::Error, text: text.to_string() }
+    }
+    pub fn info(text: &str) -> Self {
+        Status { kind: StatusKind::Info, text: text.to_string() }
     }
 }
 
-/// Options for the built-in password generator, owned by the edit form and
-/// the settings screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Password-generator settings, shown as toggles beside the password field.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratorOptions {
     pub length: usize,
     pub uppercase: bool,
@@ -229,41 +270,23 @@ impl Default for GeneratorOptions {
 }
 
 impl GeneratorOptions {
-    /// Validates against the core generator's length bounds, and refuses a
-    /// password with no character classes (core treats that as a length-valid
-    /// but useless password).
-    pub fn validate(&self) -> Result<(), String> {
-        if !(domi_core::password::MIN_PASSWORD_LENGTH..=domi_core::password::MAX_PASSWORD_LENGTH)
-            .contains(&self.length)
-        {
-            return Err(format!(
-                "Length must be between {} and {}.",
+    /// Clamps the length into the range core accepts.
+    ///
+    /// Nothing in the UI lets the length drift out of band, so this exists as
+    /// a guard rather than as validation the user sees.
+    pub fn clamped_length(&self) -> usize {
+        self.length
+            .clamp(
                 domi_core::password::MIN_PASSWORD_LENGTH,
-                domi_core::password::MAX_PASSWORD_LENGTH
-            ));
-        }
-        if !(self.uppercase || self.lowercase || self.numbers || self.symbols) {
-            return Err("Turn on at least one character type.".to_string());
-        }
-        Ok(())
-    }
-
-    pub fn generate(&self) -> Result<String, AppError> {
-        self.validate().map_err(AppError::BadInput)?;
-        domi_core::generate_password(
-            self.length,
-            self.uppercase,
-            self.lowercase,
-            self.numbers,
-            self.symbols,
-        )
-        .map_err(|e| crate::error::friendly(e, "password"))
+                domi_core::password::MAX_PASSWORD_LENGTH,
+            )
     }
 }
 
-/// Every field the edit form can focus, in tab order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The fields of the entry editor, in tab order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Field {
+    #[default]
     Title,
     Username,
     Password,
@@ -288,6 +311,7 @@ impl Field {
         Field::Tags,
     ];
 
+    /// The label shown left of the input.
     pub fn label(self) -> &'static str {
         match self {
             Field::Title => "Title",
@@ -302,42 +326,31 @@ impl Field {
         }
     }
 
-    /// Fields that hold text, as opposed to toggles and the category cycler.
+    /// Whether the field accepts typed characters.
+    ///
+    /// The two that do not — Category and Favorite — are cyclers and toggles,
+    /// so a character typed at them is a keypress for the control, not text.
     pub fn is_text(self) -> bool {
-        matches!(self, Field::Title | Field::Username | Field::Password | Field::Url | Field::Notes | Field::Totp)
+        !matches!(self, Field::Category | Field::Favorite)
     }
 
+    /// The next field in tab order, wrapping.
     pub fn next(self) -> Field {
         let i = Field::ALL.iter().position(|f| *f == self).unwrap_or(0);
         Field::ALL[(i + 1) % Field::ALL.len()]
     }
 
+    /// The previous field in tab order, wrapping.
     pub fn prev(self) -> Field {
         let i = Field::ALL.iter().position(|f| *f == self).unwrap_or(0);
         Field::ALL[(i + Field::ALL.len() - 1) % Field::ALL.len()]
     }
 }
 
-/// Every category, in cycler order. One source of truth for both
-/// [`EntryForm::cycle_category`] and its test.
-fn all_categories() -> [ItemCategory; 5] {
-    [
-        ItemCategory::Login,
-        ItemCategory::CreditCard,
-        ItemCategory::SecureNote,
-        ItemCategory::Identity,
-        ItemCategory::BankAccount,
-    ]
-}
-
-/// The editable buffer for one entry.
-///
-/// Holds real plaintext, so it is never logged or rendered directly: the form
-/// widget masks the password and totp fields and the struct is dropped on
-/// cancel.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The entry being edited.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EntryForm {
-    pub original_id: Option<String>,
+    pub id: Option<String>,
     pub title: String,
     pub username: String,
     pub password: String,
@@ -346,57 +359,44 @@ pub struct EntryForm {
     pub totp: String,
     pub category: ItemCategory,
     pub favorite: bool,
-    /// Comma-separated; split on save, trimmed, empties dropped.
+    /// Tag names, comma-separated in the UI and split on save.
     pub tags: String,
-    /// Which field has the cursor.
-    pub field: Field,
-    /// Whether password and TOTP render as dots.
+    pub generator: GeneratorOptions,
+    /// Whether the password field shows its contents.
     pub reveal: bool,
+    /// Which field has focus.
+    pub focused: Field,
 }
 
 impl EntryForm {
-    /// A blank form for a new entry.
-    pub fn new(now: i64) -> Self {
-        let _ = now;
+    /// An empty form for a new entry, focused on the title because a title is
+    /// the one field every entry needs and typing one first is what a user
+    /// always does.
+    pub fn blank() -> Self {
+        // Written out in full rather than with `..Default::default()`: the
+        // zeroizing `Drop` below stops that form-update syntax from compiling
+        // on a type that must never be copied wholesale.
         EntryForm {
-            original_id: None,
+            id: None,
             title: String::new(),
             username: String::new(),
             password: String::new(),
             url: String::new(),
             notes: String::new(),
             totp: String::new(),
-            category: ItemCategory::default(),
+            category: ItemCategory::Login,
             favorite: false,
             tags: String::new(),
-            field: Field::Title,
+            generator: GeneratorOptions::default(),
             reveal: false,
+            focused: Field::Title,
         }
     }
 
-    /// A form pre-filled from an existing entry.
-    ///
-    /// `tag_names` pairs each tag id with the name the user typed, because
-    /// core stores ids and a form field has to hold something readable and
-    /// editable. Ids with no matching name fall back to the id itself, so an
-    /// orphaned reference is visible in the field rather than dropped —
-    /// saving it back then fails loudly rather than silently untagging the
-    /// entry. See [`AppState::tag_id_names`] for where the pairs come from.
-    pub fn from_entry(entry: &Entry, tag_names: &[(String, String)]) -> Self {
-        let tags = entry
-            .tags
-            .iter()
-            .map(|id| {
-                tag_names
-                    .iter()
-                    .find(|(tag_id, _)| tag_id == id)
-                    .map(|(_, name)| name.clone())
-                    .unwrap_or_else(|| id.clone())
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
+    /// A form pre-filled from `entry`, for editing.
+    pub fn from_entry(entry: &Entry) -> Self {
         EntryForm {
-            original_id: Some(entry.id.clone()),
+            id: Some(entry.id.clone()),
             title: entry.title.clone(),
             username: entry.username.clone(),
             password: entry.password.clone(),
@@ -405,19 +405,18 @@ impl EntryForm {
             totp: entry.totp_secret.clone().unwrap_or_default(),
             category: entry.category,
             favorite: entry.favorite,
-            tags,
-            field: Field::Title,
+            // Tag ids are resolved to names by the caller, which has the index;
+            // the form only holds the names it will write back.
+            tags: String::new(),
+            generator: GeneratorOptions::default(),
             reveal: false,
+            focused: Field::Title,
         }
     }
 
-    pub fn is_new(&self) -> bool {
-        self.original_id.is_none()
-    }
-
-    /// Borrows the focused field's text for the text input to edit.
-    pub fn text(&self) -> &str {
-        match self.field {
+    /// The text currently in `field`.
+    pub fn text(&self, field: Field) -> &str {
+        match field {
             Field::Title => &self.title,
             Field::Username => &self.username,
             Field::Password => &self.password,
@@ -425,135 +424,179 @@ impl EntryForm {
             Field::Notes => &self.notes,
             Field::Totp => &self.totp,
             Field::Tags => &self.tags,
-            // Toggles and the category cycler are changed with space/left-right
-            // rather than typed into, so there is nothing to borrow.
+            // Not text fields; their value is shown differently.
             Field::Category | Field::Favorite => "",
         }
-    }
-
-    pub fn set_text(&mut self, value: String) {
-        match self.field {
-            Field::Title => self.title = value,
-            Field::Username => self.username = value,
-            Field::Password => self.password = value,
-            Field::Url => self.url = value,
-            Field::Notes => self.notes = value,
-            Field::Totp => self.totp = value,
-            Field::Tags => self.tags = value,
+    }    /// Inserts `c` at the end of `field`'s text.
+    ///
+    /// The core of the field-typing path: a keystroke becomes text without the
+    /// render layer having to track a caret.
+    pub fn insert_char(&mut self, field: Field, c: char) {
+        if !field.is_text() {
+            return;
+        }
+        match field {
+            Field::Title => self.title.push(c),
+            Field::Username => self.username.push(c),
+            Field::Password => {
+                if self.password.chars().count() < MAX_PASSWORD_LENGTH {
+                    self.password.push(c);
+                }
+            }
+            Field::Url => self.url.push(c),
+            Field::Notes => {
+                if self.notes.chars().count() < MAX_NOTES_LENGTH {
+                    self.notes.push(c);
+                }
+            }
+            Field::Totp => self.totp.push(c),
+            Field::Tags => self.tags.push(c),
             Field::Category | Field::Favorite => {}
         }
     }
 
-    /// Steps the category cycler.
-    pub fn cycle_category(&mut self) {
-        let all = all_categories();
-        let i = all.iter().position(|c| *c == self.category).unwrap_or(0);
-        self.category = all[(i + 1) % all.len()];
+    /// Removes the last character from `field`.
+    pub fn backspace(&mut self, field: Field) {
+        if !field.is_text() {
+            return;
+        }
+        match field {
+            Field::Title => {
+                self.title.pop();
+            }
+            Field::Username => {
+                self.username.pop();
+            }
+            Field::Password => {
+                self.password.pop();
+            }
+            Field::Url => {
+                self.url.pop();
+            }
+            Field::Notes => {
+                self.notes.pop();
+            }
+            Field::Totp => {
+                self.totp.pop();
+            }
+            Field::Tags => {
+                self.tags.pop();
+            }
+            Field::Category | Field::Favorite => {}
+        }
     }
 
-    pub fn toggle_favorite(&mut self) {
-        self.favorite = !self.favorite;
-    }
-
-    /// Splits the comma-separated tag field.
-    pub fn tag_list(&self) -> Vec<String> {
+    /// The tag names the user typed, split and trimmed, blanks removed.
+    pub fn tag_names(&self) -> Vec<String> {
         self.tags
             .split(',')
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
             .collect()
     }
 
-    /// Rejects a form that couldn't produce a usable entry, so the user gets a
-    /// specific reason instead of a save that silently does nothing.
-    pub fn validate(&self) -> Result<(), String> {
+    /// Whether this form is editing an existing entry rather than making one.
+    pub fn is_edit(&self) -> bool {
+        self.id.is_some()
+    }
+
+    /// Rejects what core would reject, with messages naming the field.
+    ///
+    /// Checked before any encryption so a bad form never costs the user a write.
+    pub fn validate(&self) -> Result<(), AppError> {
         if self.title.trim().is_empty() {
-            return Err("Title is required.".to_string());
+            return Err(AppError::BadInput("Title is required.".to_string()));
         }
-        if self.title.chars().count() > 200 {
-            return Err("Title must be 200 characters or fewer.".to_string());
+        if self.title.chars().count() > MAX_TITLE_LENGTH {
+            return Err(AppError::BadInput(format!(
+                "Title must be {MAX_TITLE_LENGTH} characters or fewer."
+            )));
         }
-        if self.notes.chars().count() > 10_000 {
-            return Err("Notes must be 10000 characters or fewer.".to_string());
+        if self.notes.chars().count() > MAX_NOTES_LENGTH {
+            return Err(AppError::BadInput(format!(
+                "Notes must be {MAX_NOTES_LENGTH} characters or fewer."
+            )));
         }
         Ok(())
     }
 
-    /// Materialises the form into a core `Entry`, keeping the original id and
-    /// timestamps when editing.
-    ///
-    /// `tag_ids` are the ids for `tag_list()`'s names, resolved by the caller
-    /// via [`crate::vault_store::VaultSession::ensure_tags`]. Passing them in
-    /// keeps the id/name translation next to the index that has to change.
-    pub fn to_entry(&self, id: String, now: i64, tag_ids: Vec<String>) -> Entry {
-        Entry {
-            id,
-            title: self.title.trim().to_string(),
-            username: self.username.trim().to_string(),
-            password: self.password.clone(),
-            url: self.url.trim().to_string(),
-            notes: self.notes.clone(),
-            totp_secret: if self.totp.trim().is_empty() {
-                None
-            } else {
-                Some(self.totp.trim().to_string())
-            },
-            custom_fields: Default::default(),
-            updated_at: now,
-            deleted: false,
-            tags: tag_ids,
-            collection_id: None,
-            favorite: self.favorite,
-            alias_provider: None,
-            alias_id: None,
-            alias_email: None,
-            category: self.category,
-            password_history: Vec::new(),
-            attachments: Vec::new(),
+    /// The id an entry built from this form should carry.
+    pub fn resolve_id(&self) -> String {
+        match &self.id {
+            Some(id) => id.clone(),
+            None => crate::vault_store::new_entry_id(now_unix()),
         }
     }
 }
 
-/// The whole application state.
+/// Zeroize the secrets a form holds when it is dropped.
+///
+/// Without this a closed editor would leave the password in freed heap memory
+/// until something overwrote it.
+impl Drop for EntryForm {
+    fn drop(&mut self) {
+        self.password.zeroize();
+        self.totp.zeroize();
+    }
+}
+
+/// Everything the app is.
+///
+/// One struct rather than a tree of sub-states: the screens are small and share
+/// most of their fields, and splitting them would mean every key handler reaching
+/// through several layers to touch one value.
+///
+/// No `Debug` derive, for two reasons: `VaultSession` holds a derived key and
+/// must never be formatted, and a dump of the whole state would print the typed
+/// master password and every entry the form is holding. [`AppState::summary`]
+/// gives a printable view that is safe to put in a panic message.
 pub struct AppState {
     pub screen: Screen,
     pub focus: Focus,
     pub paths: VaultPaths,
-
-    // Setup / unlock inputs.
+    /// The master password being typed, held only until it is submitted.
     pub password: String,
+    /// The confirmation typed on the setup screen, held only until it is
+    /// submitted.
     pub confirm: String,
+    /// Which setup field is taking keystrokes: 0 is the password, 1 the
+    /// confirmation.
+    ///
+    /// Only meaningful on [`Screen::Setup`]; every other screen types into
+    /// whichever field its own rules name.
+    pub setup_field: usize,
     pub kdf: KdfParams,
-    /// Argon2id at the default cost takes long enough to need a visible
-    /// "working" state, otherwise the UI looks frozen.
-    pub busy: bool,
+    /// The error shown on the setup or unlock screen.
     pub screen_error: Option<String>,
-
-    // Vault contents.
+    /// The unlocked vault, if any. Never `Clone` or `Debug` — see the type.
     pub session: Option<VaultSession>,
     pub cache: SearchCache,
     pub query: String,
+    /// Whether the search bar is taking keystrokes.
+    ///
+    /// Distinct from `query` being empty: `/` puts the cursor in the bar
+    /// before anything is typed, and until then plain letters still belong to
+    /// the shortcuts. Without this the user would have to type a character
+    /// before the first one landed in the box.
+    pub searching: bool,
     pub filter: Filter,
-    /// Visible entry ids, in display order.
+    /// The ids of the entries the list is showing, in order.
     pub rows: Vec<String>,
     pub selected: usize,
-    /// First visible row, for scroll position.
     pub offset: usize,
     /// The decrypted entry shown in the detail pane.
     pub detail: Option<Entry>,
     pub reveal: bool,
-
     pub form: Option<EntryForm>,
     pub modal: Option<Modal>,
     pub status: Option<Status>,
     pub generator: GeneratorOptions,
     /// Which settings row the cursor is on.
     pub settings_row: usize,
-
     /// Auto-lock after this many seconds of no input; 0 disables it.
     pub auto_lock_secs: u64,
     pub idle_secs: u64,
-
     pub should_quit: bool,
     /// A secret the shell wants on the system clipboard. The UI writes and
     /// then clears it, so a secret doesn't sit in state longer than a frame.
@@ -561,35 +604,22 @@ pub struct AppState {
     /// How many entries the list pane can show at the current terminal size.
     ///
     /// Fed in by the view, the only layer that knows the terminal geometry,
-    /// and read back by the render snapshot to size the scroll window.
-    pub list_capacity: usize,
-
+    /// and read back to size the scroll window.
     /// Where preferences are read from and written to.
     ///
-    /// Held as a path rather than looked up on each use so a test can point
-    /// the whole app at a scratch file. Production always uses
-    /// [`Config::default_file`], resolved once at startup.
+    /// Held as a path rather than looked up on each use so a test can point the
+    /// whole app at a scratch file. Production resolves it once at startup.
     pub config_file: PathBuf,
 }
 
-/// How an auto-lock delay reads in the settings row and in a notification.
-fn auto_lock_label(secs: u64) -> String {
-    if secs == 0 {
-        return "off".to_string();
-    }
-    if secs.is_multiple_of(3600) {
-        let hours = secs / 3600;
-        return if hours == 1 { "1 hour".to_string() } else { format!("{hours} hours") };
-    }
-    let minutes = secs / 60;
-    if minutes == 1 {
-        "1 minute".to_string()
-    } else {
-        format!("{minutes} minutes")
+impl Default for AppState {
+    fn default() -> Self {
+        AppState::new(VaultPaths::new("."))
     }
 }
 
 impl AppState {
+    /// Builds a state on the platform's real preferences path.
     pub fn new(paths: VaultPaths) -> Self {
         Self::with_config_file(paths, Config::default_file())
     }
@@ -612,12 +642,13 @@ impl AppState {
             paths,
             password: String::new(),
             confirm: String::new(),
+            setup_field: 0,
             kdf: KdfParams::default(),
-            busy: false,
             screen_error: None,
             session: None,
             cache: SearchCache::default(),
             query: String::new(),
+            searching: false,
             filter: Filter::All,
             rows: Vec::new(),
             selected: 0,
@@ -634,7 +665,6 @@ impl AppState {
             should_quit: false,
             pending_copy: None,
             // Overwritten from the terminal size on the first frame.
-            list_capacity: 0,
             config_file: file,
         }
     }
@@ -667,243 +697,363 @@ impl AppState {
             // "search inside favorites" behaves the way it reads.
             Filter::Favorites => self
                 .cache
-                .query_favorites()
+                .query(&self.query)
                 .into_iter()
-                .filter(|i| matches_query(i, &self.query))
-                .collect(),
-            Filter::Tag { id, .. } => self
-                .cache
-                .query_by_tag(id)
-                .into_iter()
-                .filter(|i| matches_query(i, &self.query))
+                .filter(|i| i.favorite)
                 .collect(),
         };
-        // `rebuild_from_index` preserves index order, which `put_entry`
-        // appends to; sort by most recently updated so the list matches what
-        // `visible_entries` shows elsewhere.
-        items.sort_by_key(|i| std::cmp::Reverse(i.updated_at));
+        // Never show a deleted entry, even if the cache still lists it.
+        items.retain(|i| {
+            self.session
+                .as_ref()
+                .is_none_or(|s| !s.index.entries.iter().any(|e| e.id == i.id && e.deleted))
+        });
+        items.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
         self.rows = items.iter().map(|i| i.id.clone()).collect();
 
-        // Keep the cursor on the same entry across a filter change where
-        // possible, so narrowing the list doesn't move the user somewhere
-        // unrelated.
-        self.selected = previous
-            .and_then(|id| self.rows.iter().position(|r| *r == id))
-            .unwrap_or_default();
+        // Restore the selection by id; otherwise clamp into the new range.
+        self.selected = self
+            .rows
+            .iter()
+            .position(|id| Some(id) == previous.as_ref())
+            .unwrap_or(0);
+        self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+        self.clamp_scroll();
+
+        // Filtering can move the selection to a different entry, so the pane
+        // has to follow. A stale detail would show a password for an entry the
+        // user is no longer looking at.
         if self.rows.is_empty() {
-            self.selected = 0;
             self.detail = None;
-        } else {
+        } else if self.selected_id() != previous {
             self.load_detail();
         }
     }
 
-    /// The currently selected entry id, if any.
+    /// The id of the selected row, if there is one.
     pub fn selected_id(&self) -> Option<String> {
         self.rows.get(self.selected).cloned()
     }
 
-    /// The selected index entry from the in-memory index.
-    pub fn selected_index_entry(&self) -> Option<&IndexEntry> {
+    /// The index entry for the selected row.
+    pub fn selected_entry(&self) -> Option<&domi_core::vault::IndexEntry> {
         let id = self.selected_id()?;
-        let session = self.session.as_ref()?;
-        session.index.entries.iter().find(|e| e.id == id)
-    }
-
-    /// The selected entry's short title, for the header.
-    pub fn selected_title(&self) -> String {
-        self.selected_index_entry().map(|e| e.title.clone()).unwrap_or_default()
-    }
-
-    /// Every live tag as `(id, name)`, for the detail pane and the edit form.
-    ///
-    /// The view and the form both need to show names; the index only has ids.
-    pub fn tag_id_names(&self) -> Vec<(String, String)> {
         self.session
-            .as_ref()
-            .map(|s| {
-                s.index
-                    .tags
-                    .iter()
-                    .filter(|t| !t.deleted)
-                    .map(|t| (t.id.clone(), t.name.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
+            .as_ref()?
+            .index
+            .entries
+            .iter()
+            .find(|e| e.id == id && !e.deleted)
     }
 
-    /// Decrypts the selected entry into the detail pane.
-    pub fn load_detail(&mut self) {
-        let Some(id) = self.selected_id() else {
-            self.detail = None;
-            return;
-        };
-        let Some(session) = &self.session else {
-            self.detail = None;
-            return;
-        };
-        self.detail = session.load_entry(&id).ok();
-    }
-
-    /// Moves the selection by `delta`, clamped to the ends so a long keypress
-    /// run can't leave the cursor past the last row.
-    pub fn move_selection(&mut self, delta: i64) {
+    /// Keeps the selected row inside the visible window.
+    ///
+    /// Ratatui's list would scroll itself, but the app also draws its own
+    /// offset for the header count, so the two have to agree.
+    fn clamp_scroll(&mut self) {
+        // The renderer clamps the window to whatever its pane can show, so all
+        // this needs to do is keep the offset sane and the selected row inside
+        // the full range.
         if self.rows.is_empty() {
-            self.selected = 0;
-            return;
-        }
-        let last = self.rows.len() as i64 - 1;
-        let next = (self.selected as i64 + delta).clamp(0, last);
-        if next as usize != self.selected {
-            self.selected = next as usize;
-            self.load_detail();
-        }
-    }
-
-    /// Keeps `selected` inside the visible window after a resize, and lets the
-    /// caller draw with `height` rows starting at `offset`.
-    pub fn clamp_scroll(&mut self, height: usize) {
-        if height == 0 {
             self.offset = 0;
             return;
         }
         if self.selected < self.offset {
             self.offset = self.selected;
         }
-        if self.selected >= self.offset + height {
-            self.offset = self.selected + 1 - height;
-        }
-        let max_offset = self.rows.len().saturating_sub(height);
-        self.offset = self.offset.min(max_offset);
+        self.offset = self.offset.min(self.rows.len() - 1);
     }
 
-    /// Called after a save or delete so the list, detail, and index agree.
-    pub fn on_entries_changed(&mut self) {
+    /// Moves the selection by `delta` rows, clamped to the list.
+    ///
+    /// The detail pane is reloaded here rather than at each draw: it means a
+    /// decryption happens once per selection change instead of once per
+    /// frame, and a pane that is only correct after an explicit call is a pane
+    /// that silently shows the wrong entry.
+    pub fn move_selection(&mut self, delta: i64) {
+        if self.rows.is_empty() {
+            self.selected = 0;
+            self.offset = 0;
+            self.detail = None;
+            return;
+        }
+        let last = self.rows.len() as i64 - 1;
+        let next = (self.selected as i64 + delta).clamp(0, last);
+        let moved = next as usize != self.selected;
+        self.selected = next as usize;
+        self.clamp_scroll();
+        if moved {
+            self.load_detail();
+        }
+        self.touch();
+    }
+
+    /// Toggles between the list and the detail pane.
+    pub fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::List => Focus::Detail,
+            Focus::Detail => Focus::List,
+        };
+    }
+
+    /// Loads the selected entry into the detail pane.
+    pub fn load_detail(&mut self) {
+        let Some(id) = self.selected_id() else {
+            self.detail = None;
+            return;
+        };
+        let result = self.session.as_ref().map(|s| s.load_entry(&id));
+        match result {
+            Some(Ok(entry)) => self.detail = Some(entry),
+            // A failure to read one entry must not blank the whole pane or
+            // crash; the status line explains it.
+            Some(Err(e)) => {
+                self.detail = None;
+                self.notify_error(e);
+            }
+            None => self.detail = None,
+        }
+    }
+
+    /// Decrypts the selected entry and opens the editor.
+    pub fn begin_edit(&mut self) {
+        let Some(id) = self.selected_id() else { return };
+        let Some(entry) = self.session.as_ref().map(|s| s.load_entry(&id)) else { return };
+        match entry {
+            Ok(entry) => {
+                let mut form = EntryForm::from_entry(&entry);
+                form.tags = self.tag_names_for(&entry).join(", ");
+                self.form = Some(form);
+                self.screen = Screen::Edit;
+                self.touch();
+            }
+            Err(e) => self.notify_error(e),
+        }
+    }
+
+    /// Opens an empty editor for a new entry.
+    pub fn begin_new(&mut self) {
+        self.form = Some(EntryForm::blank());
+        self.screen = Screen::Edit;
+        self.touch();
+    }
+
+    /// The names of the tags on `entry`, which holds only their ids.
+    pub fn tag_names_for(&self, entry: &Entry) -> Vec<String> {
+        let Some(session) = &self.session else { return Vec::new() };
+        entry
+            .tags
+            .iter()
+            .filter_map(|id| {
+                session.index.tags.iter().find(|t| &t.id == id).map(|t| t.name.clone())
+            })
+            .collect()
+    }    /// Validates and writes the open form, then returns to the list.
+    pub fn save_form(&mut self) -> Result<(), AppError> {
+        let Some(form) = self.form.clone() else {
+            return Err(AppError::BadInput("Nothing to save".to_string()));
+        };
+        form.validate()?;
+
+        let now = now_unix();
+        let id = form.resolve_id();
+        let Some(session) = self.session.as_mut() else {
+            return Err(AppError::WrongPassword);
+        };
+        let tag_ids = session.ensure_tags(&form.tag_names(), now)?;
+
+        // Keep the original timestamps when editing, so "recently changed"
+        // ordering reflects the user's edit rather than the load.
+        let previous = if form.is_edit() { session.load_entry(&id).ok() } else { None };
+        let entry = Entry {
+            id,
+            title: form.title.trim().to_string(),
+            username: form.username.trim().to_string(),
+            password: form.password.clone(),
+            url: form.url.trim().to_string(),
+            notes: form.notes.clone(),
+            totp_secret: Some(form.totp.clone())
+                .filter(|s| !s.trim().is_empty()),
+            custom_fields: previous
+                .as_ref()
+                .map(|p| p.custom_fields.clone())
+                .unwrap_or_default(),
+            updated_at: now,
+            deleted: false,
+            tags: tag_ids,
+            collection_id: previous.as_ref().and_then(|p| p.collection_id.clone()),
+            favorite: form.favorite,
+            alias_provider: previous.as_ref().and_then(|p| p.alias_provider.clone()),
+            alias_id: previous.as_ref().and_then(|p| p.alias_id.clone()),
+            alias_email: previous.as_ref().and_then(|p| p.alias_email.clone()),
+            category: form.category,
+            password_history: previous
+                .as_ref()
+                .map(|p| p.password_history.clone())
+                .unwrap_or_default(),
+            attachments: previous
+                .as_ref()
+                .map(|p| p.attachments.clone())
+                .unwrap_or_default(),
+        };
+        session.save_entry(entry)?;
+
+        self.form = None;
+        self.screen = Screen::Vault;
+        self.refresh();
+        self.notify(Status::success("Saved"));
+        self.touch();
+        Ok(())
+    }
+
+    /// Abandons the editor without writing.
+    pub fn cancel_form(&mut self) {
+        self.form = None;
+        self.screen = Screen::Vault;
         self.refresh();
     }
 
-    // ------------------------------------------------------------- filtering
-
-    pub fn set_query(&mut self, query: String) {
-        self.query = query;
-        self.recompute_rows();
-    }
-
-    pub fn set_filter(&mut self, filter: Filter) {
-        self.filter = filter;
-        self.recompute_rows();
-    }
-
-    pub fn toggle_favorite_filter(&mut self) {
-        let next =
-            if matches!(self.filter, Filter::Favorites) { Filter::All } else { Filter::Favorites };
-        self.set_filter(next);
-    }
-
-    /// Filters the list to the selected entry's first tag, or drops the filter
-    /// when it is already applied.
+    /// Deletes the selected entry after confirming.
+    /// Asks for confirmation before deleting the selected entry.
     ///
-    /// Bound to `t`: the tags an entry carries are only discoverable from the
-    /// entry, so this narrows to something the user is looking at rather than
-    /// asking them to type a tag they would have to already know.
-    pub fn toggle_tag_filter(&mut self) {
-        let Some(entry) = self.detail.clone() else {
-            self.notify(Status::error("No entry selected"));
+    /// Deleting is the one action here that destroys user data, so it never
+    /// runs off a single keystroke: this opens the dialog and
+    /// [`AppState::confirm_pending`] does the work.
+    pub fn request_delete_selected(&mut self) {
+        if self.selected_id().is_none() {
+            self.notify(Status::error("Nothing to delete"));
+            return;
+        }
+        let title = self
+            .selected_entry()
+            .map(|e| e.title.clone())
+            .unwrap_or_else(|| "this entry".to_string());
+        self.modal = Some(Modal::ask(
+            "Delete entry",
+            &format!(
+                "Delete \"{title}\"?\n\nThe entry leaves the list now and its blob stays on disk \
+                 until something overwrites that id, so this is recoverable."
+            ),
+            "Delete",
+            PendingAction::DeleteEntry,
+        ));
+    }
+
+    /// Runs the action a confirm dialog was asking about.
+    ///
+    /// The dialog must already be closed; this only consumes the action.
+    pub fn confirm_pending(&mut self, action: PendingAction) {
+        match action {
+            PendingAction::DeleteEntry => self.commit_delete_selected(),
+            PendingAction::ResetVault => self.commit_reset_vault(),
+        }
+    }
+
+    /// Performs the delete. Only reached once the user has answered yes.
+    fn commit_delete_selected(&mut self) {
+        let Some(id) = self.selected_id() else { return };
+        let result = self.session.as_mut().map(|s| s.delete_entry(&id));
+        match result {
+            Some(Ok(())) => {
+                self.detail = None;
+                self.refresh();
+                self.notify(Status::success("Deleted"));
+            }
+            Some(Err(e)) => self.notify_error(e),
+            None => {}
+        }
+    }    /// Flips the selected entry's favourite flag and persists it.
+    pub fn toggle_favorite(&mut self) {
+        let Some(id) = self.selected_id() else { return };
+        let loaded = self.session.as_ref().map(|s| s.load_entry(&id));
+        let (Some(Ok(mut entry)), Some(session)) = (loaded, self.session.as_mut()) else {
             return;
         };
-        let Some(tag_id) = entry.tags.first().cloned() else {
-            self.notify(Status::error("This entry has no tags"));
+        entry.favorite = !entry.favorite;
+        let now_favorite = entry.favorite;
+        match session.save_entry(entry) {
+            Ok(()) => {
+                self.refresh();
+                if let Some(detail) = &mut self.detail
+                    && detail.id == id
+                {
+                    detail.favorite = now_favorite;
+                }
+                self.notify(Status::success(if now_favorite {
+                    "Added to favorites"
+                } else {
+                    "Removed from favorites"
+                }));
+            }
+            Err(e) => self.notify_error(e),
+        }
+    }
+
+    /// Queues the selected entry's password for the shell to copy.
+    pub fn copy_password(&mut self) {
+        self.queue_copy(|e| e.password.clone(), "Copied password");
+    }
+
+    /// Queues the selected entry's username for the shell to copy.
+    pub fn copy_username(&mut self) {
+        self.queue_copy(|e| e.username.clone(), "Copied username");
+    }
+
+    /// Copies one field of the selected entry, reporting when there is nothing
+    /// to copy.
+    ///
+    /// The message is left to the shell, which is where the clipboard write
+    /// actually happens and can still fail.
+    fn queue_copy(&mut self, field: impl Fn(&Entry) -> String, ok: &str) {
+        let Some(id) = self.selected_id() else {
+            self.notify(Status::error("Nothing selected"));
             return;
         };
-        let name = self.tag_name(&tag_id);
-        let next = match &self.filter {
-            Filter::Tag { id, .. } if *id == tag_id => Filter::All,
-            _ => Filter::Tag { id: tag_id, name },
-        };
-        self.set_filter(next);
-    }
-
-    /// The name behind a tag id, from the in-memory index.
-    ///
-    /// Falls back to the id so a filter is always labelled with something and
-    /// a deleted tag still reads as a filter rather than silently becoming
-    /// "All".
-    fn tag_name(&self, id: &str) -> String {
-        self.tag_id_names()
-            .into_iter()
-            .find(|(tag_id, _)| tag_id == id)
-            .map(|(_, name)| name)
-            .unwrap_or_else(|| id.to_string())
-    }
-
-    // -------------------------------------------------------------- statuses
-
-    /// Shows a message and records the activity that resets the auto-lock.
-    pub fn notify(&mut self, status: Status) {
-        self.touch();
-        self.status = Some(status);
-    }
-
-    pub fn notify_error(&mut self, err: AppError) {
-        self.notify(Status::error(&err.message()));
-    }
-
-    /// Any keypress counts as activity for the auto-lock timer.
-    pub fn touch(&mut self) {
-        self.idle_secs = 0;
-    }
-
-    /// Advances the idle timer. Returns true when the vault should be locked.
-    ///
-    /// The caller must actually drop the session on true — this only decides.
-    pub fn tick_idle(&mut self, elapsed: u64) -> bool {
-        if self.auto_lock_secs == 0 || self.session.is_none() {
-            return false;
+        let Some(entry) = self.session.as_ref().map(|s| s.load_entry(&id)) else { return };
+        match entry {
+            Ok(entry) => {
+                let value = field(&entry);
+                if value.is_empty() {
+                    self.notify(Status::error("That field is empty"));
+                    return;
+                }
+                self.pending_copy = Some(value);
+                self.notify(Status::success(ok));
+            }
+            Err(e) => self.notify_error(e),
         }
-        self.idle_secs = self.idle_secs.saturating_add(elapsed);
-        self.idle_secs >= self.auto_lock_secs
     }
 
-    /// Drops the decrypted key and everything derived from it.
-    pub fn lock(&mut self) {
-        if let Some(session) = self.session.take() {
-            session.lock();
-        }
-        // Order matters: wipe the in-memory text first, then drop the key. The
-        // form holds a plaintext password and must not survive the session.
+    /// Toggles the detail pane's reveal flag.
+    pub fn toggle_reveal(&mut self) {
+        self.reveal = !self.reveal;
         if let Some(form) = self.form.as_mut() {
-            form.password.zeroize();
+            form.reveal = self.reveal;
         }
-        self.password.zeroize();
-        self.confirm.zeroize();
-        self.pending_copy = None;
-        self.detail = None;
-        self.form = None;
-        self.reveal = false;
-        self.query.zeroize();
-        self.cache = SearchCache::default();
-        self.rows.clear();
-        self.selected = 0;
-        self.offset = 0;
-        self.idle_secs = 0;
-        self.focus = Focus::List;
-        self.screen = Screen::Unlock;
-        self.screen_error = None;
+        self.touch();
     }
 
-    /// True when a modal is up, which suppresses every underlying keybinding.
-    #[cfg(test)]
-    pub fn modal_open(&self) -> bool {
-        self.modal.is_some()
+    /// Changes the master password, re-encrypting every entry.
+    pub fn change_master_password(
+        &mut self,
+        new_password: &str,
+        confirm: &str,
+    ) -> Result<(), AppError> {
+        if new_password != confirm {
+            return Err(AppError::BadInput("Passwords do not match.".to_string()));
+        }
+        if new_password.is_empty() {
+            return Err(AppError::BadInput("Password cannot be empty.".to_string()));
+        }
+        let session = self.session.as_mut().ok_or(AppError::WrongPassword)?;
+        session.rekey(new_password)?;
+        self.notify(Status::success("Master password changed"));
+        Ok(())
     }
 
-    // -------------------------------------------------------------- actions
+    // ------------------------------------------------------------- auth flow
 
-    /// Creates a vault, then unlocks it into a live session.
-    ///
-    /// Setup and Unlock share this path: creating a vault and unlocking one
-    /// are the same sequence with a different starting point, so a single
-    /// implementation keeps the two screens from drifting apart.
+    /// Creates a vault on disk and unlocks it.
     pub fn create_vault(&mut self, password: &str, confirm: &str) -> Result<(), AppError> {
         if password.is_empty() {
             return Err(AppError::BadInput("Password cannot be empty.".to_string()));
@@ -929,223 +1079,70 @@ impl AppState {
     }
 
     /// Shared post-unlock bookkeeping.
+    ///
+    /// The typed password is dropped as soon as it has done its job, so it is
+    /// not sitting in state for the rest of the session.
     fn after_unlock(&mut self) {
         self.password.zeroize();
         self.confirm.zeroize();
-        self.screen_error = None;
         self.screen = Screen::Vault;
-        self.busy = false;
         self.refresh();
         self.load_detail();
-        self.notify(Status::success("Vault unlocked"));
+        self.touch();
     }
 
-    /// Closes a modal, discarding whatever it was collecting.
-    pub fn dismiss_modal(&mut self) {
-        // A password typed into a dialog that gets cancelled must not survive
-        // in the discarded value.
-        if let Some(Modal::Password { ref mut value, .. }) = self.modal {
-            value.zeroize();
+    /// Drops the session and returns to the unlock screen.
+    pub fn lock(&mut self) {
+        if let Some(session) = self.session.take() {
+            session.lock();
         }
-        self.modal = None;
-    }
-
-    /// Opens the create-entry form.
-    pub fn begin_new_entry(&mut self) {
-        self.form = Some(EntryForm::new(now_unix()));
-        self.screen = Screen::Edit;
+        self.password.zeroize();
+        self.confirm.zeroize();
+        self.detail = None;
         self.reveal = false;
-        self.touch();
-    }
-
-    /// Opens the edit form for the selected entry.
-    pub fn begin_edit_selected(&mut self) {
-        let Some(entry) = self.detail.clone() else {
-            self.notify(Status::error("No entry selected"));
-            return;
-        };
-        let names = self.tag_id_names();
-        self.form = Some(EntryForm::from_entry(&entry, &names));
-        self.screen = Screen::Edit;
-        self.reveal = false;
-        self.touch();
-    }
-
-    /// Leaves the edit screen, discarding the form.
-    pub fn cancel_edit(&mut self) {
-        if let Some(mut form) = self.form.take() {
-            form.password.zeroize();
-        }
-        self.screen = Screen::Vault;
-        self.load_detail();
-        self.touch();
-    }
-
-    /// Validates and persists the form, then returns to the list.
-    pub fn save_form(&mut self) -> Result<(), AppError> {
-        let Some(form) = self.form.as_ref() else {
-            self.screen = Screen::Vault;
-            return Ok(());
-        };
-        if let Err(message) = form.validate() {
-            return Err(AppError::BadInput(message));
-        }
-        let id = match &form.original_id {
-            Some(id) => id.clone(),
-            None => new_entry_id(),
-        };
-        let now = now_unix();
-        let names = form.tag_list();
-        let entry_id = id;
-        // The tag ids have to exist in the index before `put_entry` will
-        // accept an entry that references them, so the names are registered
-        // first. A name the vault already knows reuses that tag.
-        let tag_ids = match self.session.as_mut() {
-            Some(session) => session.ensure_tags(&names, now)?,
-            None => return Err(AppError::WrongPassword),
-        };
-        let entry = form.to_entry(entry_id, now, tag_ids);
-        let saved_id = entry.id.clone();
-        let session = self.session.as_mut().ok_or(AppError::WrongPassword)?;
-        session.save_entry(entry)?;
         self.form = None;
-        self.screen = Screen::Vault;
-        self.on_entries_changed();
-        // Select what was just saved, so the detail pane shows it. A new entry
-        // sorts to the top and an edit keeps its position, so resolving the id
-        // is what makes this work for both.
-        if let Some(index) = self.rows.iter().position(|r| *r == saved_id) {
-            self.selected = index;
-            self.offset = self.offset.min(self.selected);
-            self.load_detail();
-        }
-        self.notify(Status::success("Entry saved"));
-        Ok(())
-    }
-
-    /// Puts a generated password into the form's password field.
-    pub fn generate_password_into_form(&mut self) {
-        let generated = match self.generator.generate() {
-            Ok(p) => p,
-            Err(e) => {
-                self.notify_error(e);
-                return;
-            }
-        };
-        if let Some(form) = self.form.as_mut() {
-            form.password = generated;
-            // A generated password is the one case where showing it is safe
-            // and expected: the user just made it up in this session.
-            form.reveal = true;
-            form.field = Field::Password;
-        }
+        self.cache = SearchCache::default();
+        self.query.clear();
+        self.searching = false;
+        self.rows.clear();
+        self.selected = 0;
+        self.offset = 0;
+        self.idle_secs = 0;
+        self.screen = Screen::Unlock;
         self.touch();
     }
 
-    /// Flips the favorite flag on the selected entry and persists it.
-    pub fn toggle_selected_favorite(&mut self) {
-        // The detail pane already holds the selected entry, so its presence is
-        // what "something is selected" means.
-        let Some(mut entry) = self.detail.clone() else {
-            self.notify(Status::error("No entry selected"));
-            return;
-        };
-        entry.favorite = !entry.favorite;
-        let session = match self.session.as_mut() {
-            Some(s) => s,
-            None => return,
-        };
-        if let Err(e) = session.save_entry(entry) {
-            self.notify_error(e);
-            return;
-        }
-        self.on_entries_changed();
-        self.load_detail();
-        let starred = self
-            .selected_index_entry()
-            .map(|e| e.favorite)
-            .unwrap_or(false);
-        self.notify(Status::success(if starred { "Added to favorites" } else { "Removed from favorites" }));
-    }
+    // ---------------------------------------------------------------- search
 
-    /// Soft-deletes the selected entry after confirmation.
-    pub fn delete_selected(&mut self) {
-        let Some(id) = self.selected_id() else {
-            self.notify(Status::error("No entry selected"));
-            return;
-        };
-        let title = self.selected_title();
-        let Some(session) = self.session.as_mut() else {
-            return;
-        };
-        if let Err(e) = session.delete_entry(&id) {
-            self.notify_error(e);
-            return;
-        }
-        self.on_entries_changed();
-        self.notify(Status::success(&format!("Deleted {title}")));
-    }
-
-    /// Queues a secret for the clipboard and flips the reveal flag so the
-    /// detail pane shows the same thing the clipboard now holds.
-    pub fn copy_password(&mut self) {
-        let Some(entry) = &self.detail else {
-            self.notify(Status::error("No entry selected"));
-            return;
-        };
-        if entry.password.is_empty() {
-            self.notify(Status::error("This entry has no password"));
-            return;
-        }
-        // The message is left to the shell, which is where the clipboard write
-        // actually happens and can still fail.
-        self.pending_copy = Some(entry.password.clone());
-    }
-
-    /// Queues the username for the clipboard.
-    pub fn copy_username(&mut self) {
-        let Some(entry) = &self.detail else {
-            self.notify(Status::error("No entry selected"));
-            return;
-        };
-        if entry.username.is_empty() {
-            self.notify(Status::error("This entry has no username"));
-            return;
-        }
-        // The message is left to the shell, which is where the clipboard write
-        // actually happens and can still fail.
-        self.pending_copy = Some(entry.username.clone());
-    }
-
-    /// Toggles the detail pane's reveal flag.
-    pub fn toggle_reveal(&mut self) {
-        self.reveal = !self.reveal;
-        if let Some(form) = self.form.as_mut() {
-            form.reveal = self.reveal;
-        }
+    /// Moves the keyboard focus into the search bar.
+    ///
+    /// The bar opens empty, so this is what lets the very first typed
+    /// character land in it instead of triggering a shortcut.
+    pub fn begin_search(&mut self) {
+        self.searching = true;
+        self.set_query(String::new());
         self.touch();
     }
 
-    /// Changes the master password, re-encrypting every entry.
-    pub fn change_master_password(&mut self, new_password: &str, confirm: &str) -> Result<(), AppError> {
-        if new_password != confirm {
-            return Err(AppError::BadInput("Passwords do not match.".to_string()));
-        }
-        if new_password.is_empty() {
-            return Err(AppError::BadInput("Password cannot be empty.".to_string()));
-        }
-        let session = self.session.as_mut().ok_or(AppError::WrongPassword)?;
-        session.rekey(new_password)?;
-        self.notify(Status::success("Master password changed"));
-        Ok(())
+    /// Takes the keyboard focus back out of the search bar, keeping the query.
+    pub fn end_search(&mut self) {
+        self.searching = false;
+        self.touch();
     }
 
-    /// The seconds remaining before auto-lock, for the status line.
-    pub fn auto_lock_countdown(&self) -> Option<u64> {
-        if self.auto_lock_secs == 0 || self.session.is_none() {
-            return None;
-        }
-        Some(self.auto_lock_secs.saturating_sub(self.idle_secs))
+    /// Applies a search query.
+    pub fn set_query(&mut self, query: String) {
+        self.query = query;
+        self.recompute_rows();
+        self.touch();
+    }
+
+    /// Switches between all and favourites.
+    pub fn toggle_filter(&mut self) {
+        self.filter = self.filter.toggled();
+        self.recompute_rows();
+        self.notify(Status::info(&format!("Showing {}", self.filter.label())));
+        self.touch();
     }
 
     // ------------------------------------------------------------- settings
@@ -1153,33 +1150,13 @@ impl AppState {
     /// The auto-lock delays the settings screen steps through, in seconds.
     ///
     /// Each step is a multiple of the previous one so the arrow keys sweep
-    /// from "off" to a full day without a long walk, and every step renders
-    /// as a whole number of minutes.
+    /// from "off" to a full day without a long walk, and every step renders as
+    /// a whole number of minutes.
     pub const AUTO_LOCK_STEPS: [u64; 7] = [0, 60, 300, 900, 1800, 3600, 21600];
-
-    /// The rows on the settings screen, in display order.
-    ///
-    /// The vault row is first because it is the one a user is most likely to
-    /// come here to change, and it is the only row whose value is free text.
-    pub const ROW_VAULT: usize = 0;
-    /// The key-derivation row, shown for information only.
-    pub const ROW_KDF: usize = 1;
-    /// The auto-lock row, changed with left/right.
-    pub const ROW_AUTO_LOCK: usize = 2;
-    /// The master-password row, which opens the rekey flow.
-    pub const ROW_MASTER_PASSWORD: usize = 3;
-    /// The row that closes the vault and discards its entries.
-    pub const ROW_RESET: usize = 4;
-
-    /// The number of rows on the settings screen.
-    ///
-    /// The view renders one row per constant above, and this bounds the
-    /// cursor to them.
-    pub const SETTINGS_ROWS: usize = 5;
 
     /// Moves the settings cursor by `delta`, clamped to the available rows.
     pub fn move_settings_row(&mut self, delta: i64) {
-        let last = Self::SETTINGS_ROWS.saturating_sub(1) as i64;
+        let last = SETTINGS_ROWS.saturating_sub(1) as i64;
         let next = self.settings_row as i64 + delta;
         self.settings_row = next.clamp(0, last) as usize;
         self.touch();
@@ -1187,20 +1164,17 @@ impl AppState {
 
     /// Steps the auto-lock delay up or down to the next preset.
     ///
-    /// Stepping past an end wraps around, so the delay is always reachable
-    /// with the arrow keys regardless of where it started.
+    /// Stepping past an end wraps around, so the delay is always reachable with
+    /// the arrow keys regardless of where it started.
     pub fn step_auto_lock(&mut self, delta: i64) {
         let steps = Self::AUTO_LOCK_STEPS;
         let current = steps.iter().position(|s| *s == self.auto_lock_secs);
         let index: usize = match (current, delta.signum()) {
             (Some(i), 1) => (i + 1) % steps.len(),
             (Some(i), _) => (i + steps.len() - 1) % steps.len(),
-            // A delay that is not one of the presets starts from the step
-            // above it, so stepping up never appears to do nothing.
-            (None, 1) => steps
-                .iter()
-                .position(|s| *s > self.auto_lock_secs)
-                .unwrap_or(0),
+            // A delay that is not one of the presets starts from the step above
+            // it, so stepping up never appears to do nothing.
+            (None, 1) => steps.iter().position(|s| *s > self.auto_lock_secs).unwrap_or(0),
             (None, _) => steps.len() - 1,
         };
         self.auto_lock_secs = steps[index];
@@ -1215,15 +1189,15 @@ impl AppState {
 
     /// Writes the current auto-lock delay to the config file.
     ///
+    /// Read-modify-write, not a fresh Config: writing a struct with only
+    /// `auto_lock_secs` set would silently delete a `vault_dir` the user had
+    /// already saved. An unreadable existing file falls back to a blank one.
+    ///
     /// A failure is reported rather than swallowed: the value still applies to
     /// this session, and the user needs to know it will not survive a restart.
-    /// The delay is written on every step rather than on exit, so a crash or a
-    /// `ctrl+c` cannot lose the setting.
+    /// Written on every step rather than on exit, so a crash or a `ctrl+c`
+    /// cannot lose the setting.
     fn persist_auto_lock(&mut self) {
-        // Read-modify-write, not a fresh Config: writing a struct with only
-        // `auto_lock_secs` set would silently delete a `vault_dir` the user had
-        // already saved. An unreadable existing file falls back to a blank one,
-        // and `set_vault_dir` is the only other writer.
         let mut cfg = Config::load_from(&self.config_file).unwrap_or_default();
         cfg.auto_lock_secs = Some(self.auto_lock_secs);
         if let Err(e) = cfg.save_to(&self.config_file) {
@@ -1257,6 +1231,15 @@ impl AppState {
         Ok(())
     }
 
+    /// Opens the dialog that names a new vault directory.
+    ///
+    /// Seeded with the current path so the user edits the value they can see
+    /// rather than retyping it from memory, which is where typos come from.
+    pub fn begin_vault_dir_change(&mut self) {
+        let current = self.paths.root().to_string_lossy().to_string();
+        self.modal = Some(Modal::Text { title: "vault directory".into(), value: current });
+    }
+
     /// Opens the master-password dialog for the highlighted row.
     ///
     /// The old password is not asked for: the vault is already unlocked, and
@@ -1267,28 +1250,111 @@ impl AppState {
             self.notify(Status::error("Unlock the vault first"));
             return;
         }
-        self.modal = Some(Modal::Password { title: "master password".into(), value: String::new() });
+        self.modal = Some(Modal::Password {
+            title: "master password".into(),
+            value: String::new(),
+            confirm: String::new(),
+            confirm_active: false,
+        });
     }
 
-    /// Opens the dialog that names a new vault directory.
+    /// Closes the vault and returns to the unlock screen.
     ///
-    /// Seeded with the current path so the user edits the value they can see
-    /// rather than retyping it from memory, which is where typos come from.
-    pub fn begin_vault_dir_change(&mut self) {
-        let current = self.paths.root().to_string_lossy().to_string();
-        self.modal = Some(Modal::Text { title: "vault directory".into(), value: current });
+    /// Named for what it does rather than "delete": the entries on disk are not
+    /// touched, so this is reversible by unlocking again.
+    /// Asks for confirmation before emptying the vault.
+    ///
+    /// A reset deletes every entry blob and re-encrypts a fresh index, so it is
+    /// the most destructive thing the app can do and needs an explicit yes.
+    pub fn request_reset_vault(&mut self) {
+        let count = self.total_entry_count();
+        self.modal = Some(Modal::ask(
+            "Reset vault",
+            &format!(
+                "Delete all {count} entries and start over?\n\n\
+                 This cannot be undone."
+            ),
+            "Erase",
+            PendingAction::ResetVault,
+        ));
     }
 
-    /// Confirms the destructive settings action.
-    pub fn reset_vault(&mut self) {
-        if let Some(session) = self.session.take() {
-            session.lock();
+    /// Performs the reset. Only reached once the user has answered yes.
+    fn commit_reset_vault(&mut self) {
+        let Some(session) = self.session.as_mut() else {
+            self.notify_error(AppError::NoVault);
+            return;
+        };
+        match session.wipe() {
+            Ok(count) => {
+                self.detail = None;
+                self.form = None;
+                self.refresh();
+                self.notify(Status::success(&format!("Vault reset, {count} entries erased")));
+            }
+            Err(e) => self.notify_error(e),
         }
-        self.lock();
-        self.notify(Status::error("The vault is locked"));
     }
 
-    // ------------------------------------------------------- render helpers
+    /// Locks the vault and returns to the unlock screen.
+    ///
+    /// The entries on disk are untouched, so this is reversible by unlocking
+    /// again; it is what the settings row offers.
+    pub fn lock_from_settings(&mut self) {
+        self.lock();
+        self.notify(Status::info("The vault is locked"));
+    }
+
+    // ----------------------------------------------------------------- chrome    /// Closes whatever modal is up.
+    pub fn dismiss_modal(&mut self) {
+        self.modal = None;
+        self.touch();
+    }
+
+    /// Shows a message in the status line.
+    pub fn notify(&mut self, status: Status) {
+        self.status = Some(status);
+    }
+
+    /// Shows an error in the status line.
+    pub fn notify_error(&mut self, e: AppError) {
+        self.notify(Status::error(&e.message()));
+    }
+
+    /// Marks the state as needing a redraw.
+    ///
+    /// A no-op counter would cost a comparison on every mutation; the render
+    /// loop simply redraws after each key, so this exists to make the intent
+    /// explicit at the call sites rather than to drive anything.
+    pub fn touch(&mut self) {}
+
+    /// Counts `elapsed` seconds of inactivity, locking if the delay has passed.
+    ///
+    /// Returns whether the vault was locked.
+    pub fn tick_idle(&mut self, elapsed: u64) -> bool {
+        if self.auto_lock_secs == 0 || self.session.is_none() {
+            return false;
+        }
+        self.idle_secs = self.idle_secs.saturating_add(elapsed);
+        if self.idle_secs >= self.auto_lock_secs {
+            self.lock();
+            return true;
+        }
+        false
+    }
+
+    /// Resets the idle timer, called on every keystroke.
+    pub fn note_activity(&mut self) {
+        self.idle_secs = 0;
+    }
+
+    /// The seconds remaining before auto-lock, for the status line.
+    pub fn auto_lock_countdown(&self) -> Option<u64> {
+        if self.auto_lock_secs == 0 || self.session.is_none() {
+            return None;
+        }
+        Some(self.auto_lock_secs.saturating_sub(self.idle_secs))
+    }
 
     /// How many entries the vault holds, ignoring the current filter, so the
     /// header count doesn't change as the user searches.
@@ -1299,1520 +1365,625 @@ impl AppState {
             .unwrap_or(0)
     }
 
-    /// A short form of the vault path for the header.
-    pub fn vault_path_display(&self) -> String {
-        self.paths.root().display().to_string()
+    /// How many entries the list is showing after filtering.
+    pub fn filtered_count(&self) -> usize {
+        self.rows.len()
     }
 
-    /// The line shown after the screen name in the header: the selected entry
-    /// when there is one, otherwise the active filter.
-    pub fn render_context(&self) -> String {
-        if self.screen != Screen::Vault {
-            return String::new();
-        }
-        let title = self.selected_title();
-        if !title.is_empty() {
-            return title;
-        }
-        if self.filter.is_narrowed() {
-            self.filter.label()
-        } else {
-            String::new()
-        }
-    }
-
-    /// A cheap, cloneable snapshot for rendering.
-    ///
-    /// The session is deliberately left out: rendering only needs the entry
-    /// list, which is already materialized in `rows` and `detail`.
-    pub fn clone_for_render(&self) -> RenderSnapshot {
-        RenderSnapshot {
-            screen: self.screen,
-            focus: self.focus,
-            query: self.query.clone(),
-            filter: self.filter.clone(),
-            selected: self.selected,
-            offset: self.offset,
-            detail: self.detail.clone(),
-            reveal: self.reveal,
-            form: self.form.clone(),
-            modal: self.modal.clone(),
-            status: self.status.clone(),
-            password: self.password.clone(),
-            confirm: self.confirm.clone(),
-            kdf: self.kdf,
-            screen_error: self.screen_error.clone(),
-            settings_row: self.settings_row,
-            auto_lock_secs: self.auto_lock_secs,
-            auto_lock_countdown: self.auto_lock_countdown(),
-            session_present: self.session.is_some(),
-            total_entries: self.total_entry_count(),
-            path: self.vault_path_display(),
-            context: self.render_context(),
-            tag_names: self.tag_id_names(),
-            list_capacity: self.list_capacity,
-            list_rows: self.render_rows(),
-        }
-    }
-
-    /// Builds the display rows for the current selection, from the in-memory
-    /// index. No decryption happens here: titles and usernames are already in
-    /// the index, and a TOTP marker only reflects the selected entry.
-    pub fn render_rows(&self) -> Vec<crate::widgets::entry_list::ListRow> {
-        let Some(session) = self.session.as_ref() else {
-            return Vec::new();
+    /// The title and username for one row, for the list renderer.
+    pub fn row_label(&self, index: usize) -> (String, String, bool) {
+        let Some(id) = self.rows.get(index) else { return (String::new(), String::new(), false) };
+        let Some(entry) = self
+            .session
+            .as_ref()
+            .and_then(|s| s.index.entries.iter().find(|e| &e.id == id))
+        else {
+            return (String::new(), String::new(), false);
         };
-        let selected_id = self.selected_id();
-        self.rows
-            .iter()
-            .filter_map(|id| {
-                let e = session.index.entries.iter().find(|e| &e.id == id)?;
-                let is_selected = Some(&e.id) == selected_id.as_ref();
-                Some(crate::widgets::entry_list::ListRow {
-                    id: e.id.clone(),
-                    title: if e.title.is_empty() { "(untitled)".to_string() } else { e.title.clone() },
-                    subtitle: if e.username.is_empty() { e.url.clone() } else { e.username.clone() },
-                    favorite: e.favorite,
-                    has_totp: is_selected
-                        && self.detail.as_ref().and_then(crate::widgets::detail::current_totp).is_some(),
-                })
-            })
-            .collect()
+        (entry.title.clone(), entry.username.clone(), entry.favorite)
     }
-}
 
-/// The subset of [`AppState`] the view layer reads.
-///
-/// A plain owned copy with no `VaultSession`, so rendering cannot reach key
-/// material and the view is trivially `Send + Sync`.
-#[derive(Clone)]
-pub struct RenderSnapshot {
-    pub screen: Screen,
-    pub focus: Focus,
-    pub query: String,
-    pub filter: Filter,
-    pub selected: usize,
-    pub offset: usize,
-    pub detail: Option<Entry>,
-    pub reveal: bool,
-    pub form: Option<EntryForm>,
-    pub modal: Option<Modal>,
-    pub status: Option<Status>,
-    pub password: String,
-    pub confirm: String,
-    pub kdf: KdfParams,
-    pub screen_error: Option<String>,
-    pub settings_row: usize,
-    pub auto_lock_secs: u64,
-    /// Seconds until auto-lock fires, or `None` when it is off. See
-    /// [`AppState::auto_lock_countdown`].
-    pub auto_lock_countdown: Option<u64>,
-    pub session_present: bool,
-    pub total_entries: usize,
-    pub path: String,
-    pub context: String,
-    /// Every live tag as `(id, name)`, so the view can print names.
-    pub tag_names: Vec<(String, String)>,
-    /// Rows the list pane can show; see [`AppState::list_capacity`].
-    pub list_capacity: usize,
-    /// Rows prepared for display, so the view never touches the session.
-    pub list_rows: Vec<crate::widgets::entry_list::ListRow>,
-}
-
-/// A fresh entry id.
-///
-/// Core mints ids for its own callers, but the TUI needs one per new entry
-/// without taking on a uuid dependency. Mixing the process id, a monotonic
-/// counter, and the wall clock gives 32 hex characters that cannot collide
-/// within a vault.
-fn new_entry_id() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-
-    // `{:04x}` and `{:012x}` are *minimum* widths, not caps, so a pid above
-    // 0xffff or a counter above 2^48 would widen the id past 32 characters.
-    // Callers assume the fixed width, so truncate rather than pad.
-    let pid = (std::process::id() as u64) & 0xffff;
-    let seq = seq & ((1u64 << 48) - 1);
-
-    format!("{nanos:016x}{pid:04x}{seq:012x}")
-}
-
-/// Case-insensitive substring match across the fields core searches.
-fn matches_query(item: &domi_core::search::SearchItem, query: &str) -> bool {
-    if query.trim().is_empty() {
-        return true;
+    /// Generates a password from the form's generator settings.
+    pub fn generate_password(&mut self) -> Result<(), AppError> {
+        let options = self
+            .form
+            .as_ref()
+            .map(|f| f.generator.clone())
+            .unwrap_or_else(|| self.generator.clone());
+        // The character-class check runs first because it is the one the user
+        // can actually fix: turning a class back on. The length is clamped
+        // rather than refused, since nothing in the UI lets it drift out of
+        // range in the first place and a rejection would read as a crash.
+        if !options.uppercase && !options.lowercase && !options.numbers && !options.symbols {
+            return Err(AppError::BadInput("Turn on at least one kind of character.".into()));
+        }
+        let generated = domi_core::password::generate_password(
+            options.clamped_length(),
+            options.uppercase,
+            options.lowercase,
+            options.numbers,
+            options.symbols,
+        )
+        .map_err(|e| AppError::BadInput(e.to_string()))?;
+        if let Some(form) = self.form.as_mut() {
+            form.password = generated;
+        } else {
+            self.notify(Status::error("Open an entry first"));
+            return Ok(());
+        }
+        self.notify(Status::success("Password generated"));
+        self.touch();
+        Ok(())
     }
-    let q = query.to_lowercase();
-    item.title.to_lowercase().contains(&q)
-        || item.username.to_lowercase().contains(&q)
-        || item.url.to_lowercase().contains(&q)
+
+    /// The entry the detail pane is showing.
+    pub fn detail(&self) -> Option<&Entry> {
+        self.detail.as_ref()
+    }}
+
+/// The vault row, the one whose value is free text.
+pub const ROW_VAULT: usize = 0;
+/// The key-derivation row, shown for information only.
+pub const ROW_KDF: usize = 1;
+/// The auto-lock row, changed with left/right.
+pub const ROW_AUTO_LOCK: usize = 2;
+/// The master-password row, which opens the rekey flow.
+pub const ROW_MASTER_PASSWORD: usize = 3;
+/// The row that closes the vault and discards its entries.
+pub const ROW_RESET: usize = 4;
+
+/// The number of rows on the settings screen.
+pub const SETTINGS_ROWS: usize = 5;
+
+/// The first settings row to draw so that the cursor stays on screen.
+///
+/// Pure, because the view only ever has `&AppState`: the geometry comes in as
+/// an argument and nothing is written back. On a terminal too short to show all
+/// five rows, this is what keeps reset and rekey reachable instead of silently
+/// clipped off the bottom.
+pub fn settings_window(cursor: usize, capacity: usize) -> usize {
+    let capacity = capacity.clamp(1, SETTINGS_ROWS);
+    let max_offset = SETTINGS_ROWS - capacity;
+    // Scroll down only as far as the cursor demands, so the first rows stay put
+    // until the cursor actually reaches them.
+    if cursor < capacity { 0 } else { cursor + 1 - capacity }.min(max_offset)
+}
+
+/// How an auto-lock delay reads in the settings row and in a notification.
+pub fn auto_lock_label(secs: u64) -> String {
+    if secs == 0 {
+        return "off".to_string();
+    }
+    if secs.is_multiple_of(3600) {
+        let hours = secs / 3600;
+        return if hours == 1 { "1 hour".to_string() } else { format!("{hours} hours") };
+    }
+    let minutes = secs / 60;
+    if minutes == 1 {
+        "1 minute".to_string()
+    } else {
+        format!("{minutes} minutes")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit;
+    use crate::vault_store::testing::TempVault;
 
-    /// Builds a state whose preferences live in a scratch file.
-    ///
-    /// Every test in this module goes through here instead of
-    /// [`AppState::new`]. `AppState::new` resolves the real
-    /// `~/.config/domi/config.toml`, so a test that stepped auto-lock would
-    /// otherwise write the developer's actual preferences — and a suite run
-    /// would leave a `config.toml` behind that changes the app's behaviour on
-    /// the next real launch. The scratch file is unique per call and removed
-    /// on drop.
-    fn app_state(paths: VaultPaths) -> AppState {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        let n = N.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("domi-prefs-auto-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        AppState::with_config_file(paths, dir.join("config.toml"))
+    /// A state on a throwaway vault, on whatever screen that vault implies.
+    fn app_state() -> (TempVault, AppState) {
+        let tmp = TempVault::new();
+        let state = testkit::state_at(tmp.paths());
+        (tmp, state)
     }
-    use domi_core::vault::Index;
 
-    fn idx_entry(id: &str, title: &str, username: &str, updated_at: i64) -> IndexEntry {
-        IndexEntry {
-            id: id.into(),
-            title: title.into(),
-            username: username.into(),
-            url: String::new(),
-            updated_at,
-            deleted: false,
-            tags: Vec::new(),
-            collection_id: None,
-            favorite: false,
-            category: ItemCategory::Login,
-            attachments: Vec::new(),
+    /// A window big enough for the whole list never scrolls, whatever the cursor.
+    #[test]
+    fn a_settings_window_that_fits_everything_does_not_scroll() {
+        for cursor in 0..SETTINGS_ROWS {
+            assert_eq!(settings_window(cursor, SETTINGS_ROWS), 0, "cursor {cursor}");
         }
     }
 
-    fn state_with(entries: Vec<IndexEntry>) -> AppState {
-        let dir = std::env::temp_dir().join(format!(
-            "domi-state-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        let session =
-            VaultSession::create(VaultPaths::new(&dir), "pw", crate::vault_store::test_params())
-                .expect("test vault should create");
-        let mut session = session;
-        session.index = Index { version: 1, entries, ..Default::default() };
-
-        let mut s = app_state(VaultPaths::new("/tmp/domi-state-unused"));
-        s.session = Some(session);
-        s
-    }
-
+    /// On a terminal too short for the list, the cursor row is always drawn.
     #[test]
-    fn every_screen_has_a_title() {
-        for screen in [Screen::Setup, Screen::Unlock, Screen::Vault, Screen::Edit, Screen::Settings] {
-            assert!(!screen.title().is_empty());
-        }
-    }
-
-    #[test]
-    fn the_settings_cursor_stops_at_both_ends() {
-        let mut s = app_state(VaultPaths::new("/tmp/nope"));
-        s.move_settings_row(-1);
-        assert_eq!(s.settings_row, 0, "cannot move above the first row");
-
-        for _ in 0..(AppState::SETTINGS_ROWS * 2) {
-            s.move_settings_row(1);
-        }
-        assert_eq!(s.settings_row, AppState::SETTINGS_ROWS - 1, "cannot move past the last");
-
-        s.move_settings_row(1);
-        assert_eq!(s.settings_row, AppState::SETTINGS_ROWS - 1);
-        s.move_settings_row(-(AppState::SETTINGS_ROWS as i64));
-        assert_eq!(s.settings_row, 0);
-    }
-
-    #[test]
-    fn stepping_auto_lock_walks_the_presets_and_wraps() {
-        let mut s = app_state(VaultPaths::new("/tmp/nope"));
-        s.auto_lock_secs = 0;
-        for expected in &AppState::AUTO_LOCK_STEPS[1..] {
-            s.step_auto_lock(1);
-            assert_eq!(s.auto_lock_secs, *expected);
-        }
-        s.step_auto_lock(1);
-        assert_eq!(s.auto_lock_secs, 0, "stepping past the end wraps to off");
-
-        s.step_auto_lock(-1);
-        assert_eq!(s.auto_lock_secs, *AppState::AUTO_LOCK_STEPS.last().unwrap());
-    }
-
-    #[test]
-    fn stepping_auto_lock_never_lands_off_the_end_of_the_list() {
-        let mut s = app_state(VaultPaths::new("/tmp/nope"));
-        // A delay set outside the presets must still step somewhere sane.
-        s.auto_lock_secs = 7;
-        s.step_auto_lock(1);
-        assert!(AppState::AUTO_LOCK_STEPS.contains(&s.auto_lock_secs), "got {}", s.auto_lock_secs);
-        s.step_auto_lock(-1);
-        assert!(AppState::AUTO_LOCK_STEPS.contains(&s.auto_lock_secs));
-    }
-
-    #[test]
-    fn changing_auto_lock_restarts_the_idle_timer() {
-        // Otherwise a delay the user just raised could fire immediately,
-        // stranding them with a vault that locks as soon as they look at it.
-        let mut s = app_state(VaultPaths::new("/tmp/nope"));
-        s.auto_lock_secs = 60;
-        s.idle_secs = 55;
-        s.step_auto_lock(1);
-        assert_eq!(s.idle_secs, 0);
-    }
-
-    #[test]
-    fn changing_the_master_password_needs_an_unlocked_vault() {
-        let mut s = app_state(VaultPaths::new("/tmp/nope"));
-        s.begin_master_password_change();
-        assert!(s.modal.is_none(), "a locked vault has nothing to rekey");
-        assert!(matches!(s.status.as_ref().map(|s| s.kind), Some(StatusKind::Error)));
-    }
-
-    #[test]
-    fn the_tag_filter_narrows_to_the_selected_entry_first_tag() {
-        let t = crate::vault_store::testing::TempVault::new();
-        let mut s = app_state(t.paths());
-        s.create_vault("master", "master").unwrap();
-
-        s.begin_new_entry();
-        {
-            let f = s.form.as_mut().unwrap();
-            f.title = "GitHub".into();
-            f.tags = "work".into();
-        }
-        s.save_form().unwrap();
-        assert_eq!(s.rows.len(), 1, "the entry should be listed after saving");
-
-        // The entry holds the id the tag was registered under, and the filter
-        // label shows the name. Together that is what makes the round trip
-        // work: the user typed "work", the entry stores an id, the status line
-        // reads "#work".
-        let tag_id = s.detail.as_ref().unwrap().tags[0].clone();
-        assert_ne!(tag_id, "work", "the entry must hold an id, not the name");
-        assert_eq!(s.tag_name(&tag_id), "work");
-
-        s.toggle_tag_filter();
-        assert_eq!(s.filter, Filter::Tag { id: tag_id.clone(), name: "work".into() });
-        assert_eq!(s.filter.label(), "#work");
-        assert!(s.filter.is_narrowed());
-        assert_eq!(s.rows.len(), 1, "the tagged entry is in the filtered list");
-
-        // Pressing the key again returns to the whole vault.
-        s.toggle_tag_filter();
-        assert_eq!(s.filter, Filter::All);
-    }
-
-    #[test]
-    fn an_untagged_entry_says_so_instead_of_silently_doing_nothing() {
-        let t = crate::vault_store::testing::TempVault::new();
-        let mut s = app_state(t.paths());
-        s.create_vault("master", "master").unwrap();
-        s.rows.push("a".into());
-        s.load_detail();
-        s.toggle_tag_filter();
-        assert_eq!(s.filter, Filter::All, "no tag means no filter");
-        assert!(matches!(s.status.as_ref().map(|s| s.kind), Some(StatusKind::Error)));
-    }
-
-    #[test]
-    fn saving_an_entry_creates_the_tag_it_names() {
-        let t = crate::vault_store::testing::TempVault::new();
-        let mut s = app_state(t.paths());
-        s.create_vault("master", "master").unwrap();
-
-        s.begin_new_entry();
-        {
-            let f = s.form.as_mut().unwrap();
-            f.title = "GitHub".into();
-            f.tags = "work, personal".into();
-        }
-        s.save_form().unwrap();
-
-        // `put_entry` refuses an entry carrying an unregistered tag id, so
-        // reaching a saved entry at all means the tags were registered.
-        let names: Vec<String> = s.tag_id_names().into_iter().map(|(_, n)| n).collect();
-        assert_eq!(names, vec!["work", "personal"]);
-        assert_eq!(s.detail.as_ref().unwrap().tags.len(), 2);
-    }
-
-    #[test]
-    fn the_same_tag_name_typed_twice_is_one_tag() {
-        let t = crate::vault_store::testing::TempVault::new();
-        let mut s = app_state(t.paths());
-        s.create_vault("master", "master").unwrap();
-
-        let save = |s: &mut AppState, title: &str, tags: &str| {
-            s.begin_new_entry();
-            let f = s.form.as_mut().unwrap();
-            f.title = title.into();
-            f.tags = tags.into();
-            s.save_form().unwrap();
-        };
-
-        save(&mut s, "First", "work");
-        save(&mut s, "Second", "Work");
-
-        assert_eq!(s.tag_id_names().len(), 1, "case must not fork the tag");
-        assert_eq!(s.tag_id_names()[0].1, "work");
-        // Both entries point at the one tag, so filtering by it finds both.
-        s.toggle_tag_filter();
-        assert_eq!(s.rows.len(), 2);
-    }
-
-    #[test]
-    fn a_tag_filter_finds_every_entry_carrying_it() {
-        let t = crate::vault_store::testing::TempVault::new();
-        let mut s = app_state(t.paths());
-        s.create_vault("master", "master").unwrap();
-
-        let save = |s: &mut AppState, title: &str, tags: &str| {
-            s.begin_new_entry();
-            let f = s.form.as_mut().unwrap();
-            f.title = title.into();
-            f.tags = tags.into();
-            s.save_form().unwrap();
-        };
-        save(&mut s, "GitHub", "work");
-        save(&mut s, "Bank", "work, finance");
-        save(&mut s, "Recipes", "home");
-        assert_eq!(s.rows.len(), 3);
-
-        s.begin_edit_selected();
-        // "Recipes" is newest, so it is selected; step to GitHub to filter on
-        // a tag the other two share.
-        s.move_selection(-1);
-        s.toggle_tag_filter();
-        assert_eq!(s.filter.label(), "#work");
-        assert_eq!(s.rows.len(), 2, "GitHub and Bank both carry work");
-    }
-
-    #[test]
-    fn tags_survive_closing_and_reopening_the_vault() {
-        let t = crate::vault_store::testing::TempVault::new();
-        let paths = t.paths();
-        {
-            let mut s = app_state(paths.clone());
-            s.create_vault("master", "master").unwrap();
-            s.begin_new_entry();
-            let f = s.form.as_mut().unwrap();
-            f.title = "GitHub".into();
-            f.tags = "work".into();
-            s.save_form().unwrap();
-        }
-
-        // The tag lives in the index, so reopening has to resolve the entry's
-        // tag id back to a name rather than showing the raw id.
-        let mut s = app_state(paths);
-        s.unlock("master").unwrap();
-        assert_eq!(s.tag_id_names().len(), 1);
-        assert_eq!(s.tag_id_names()[0].1, "work");
-        assert_eq!(s.detail.as_ref().unwrap().tags, s.tag_id_names().iter().map(|(id, _)| id.clone()).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn editing_an_entry_shows_its_tag_names_and_resaves_the_same_ids() {
-        let t = crate::vault_store::testing::TempVault::new();
-        let mut s = app_state(t.paths());
-        s.create_vault("master", "master").unwrap();
-
-        s.begin_new_entry();
-        {
-            let f = s.form.as_mut().unwrap();
-            f.title = "GitHub".into();
-            f.tags = "work".into();
-        }
-        s.save_form().unwrap();
-        let tag_id = s.detail.as_ref().unwrap().tags[0].clone();
-
-        s.begin_edit_selected();
-        assert_eq!(s.form.as_ref().unwrap().tags, "work", "the form shows the name");
-
-        // Saving the form untouched must not fork the tag or duplicate it.
-        s.save_form().unwrap();
-        assert_eq!(s.tag_id_names().len(), 1);
-        assert_eq!(s.detail.as_ref().unwrap().tags, vec![tag_id]);
-    }
-
-    #[test]
-    fn removing_the_last_tag_keeps_the_entry_and_its_tags_out_of_the_index() {
-        let t = crate::vault_store::testing::TempVault::new();
-        let mut s = app_state(t.paths());
-        s.create_vault("master", "master").unwrap();
-
-        s.begin_new_entry();
-        {
-            let f = s.form.as_mut().unwrap();
-            f.title = "GitHub".into();
-            f.tags = "work".into();
-        }
-        s.save_form().unwrap();
-
-        s.begin_edit_selected();
-        s.form.as_mut().unwrap().tags = String::new();
-        s.save_form().unwrap();
-
-        assert!(s.detail.as_ref().unwrap().tags.is_empty());
-        // The tag stays in the index, unreferenced: core's `delete_tag` is the
-        // thing that retires a tag, and nothing in the TUI calls it.
-        assert_eq!(s.tag_id_names().len(), 1, "the tag is left defined, just unused");
-    }
-
-    #[test]
-    fn initial_screen_depends_on_whether_a_vault_exists() {
-        let existing = std::env::temp_dir().join("domi-state-test-exists");
-        let _ = std::fs::create_dir_all(&existing);
-        std::fs::write(existing.join("manifest.json"), "{}").unwrap();
-
-        let mut s = app_state(VaultPaths::new(&existing));
-        assert_eq!(s.initial_screen(), Screen::Unlock);
-
-        let mut missing = app_state(VaultPaths::new("/tmp/domi-state-missing-dir"));
-        assert_eq!(missing.initial_screen(), Screen::Setup);
-
-        let _ = std::fs::remove_dir_all(&existing);
-    }
-
-    #[test]
-    fn rows_are_newest_updated_first() {
-        let mut s = state_with(vec![
-            idx_entry("a", "Older", "u", 100),
-            idx_entry("b", "Newest", "u", 300),
-            idx_entry("c", "Middle", "u", 200),
-        ]);
-        s.refresh();
-        assert_eq!(s.rows, vec!["b", "c", "a"]);
-        assert_eq!(s.selected, 0);
-    }
-
-    #[test]
-    fn query_filters_case_insensitively_across_title_user_and_url() {
-        let mut s = state_with(vec![
-            idx_entry("a", "GitHub", "octocat", 100),
-            idx_entry("b", "Bank", "alice", 200),
-        ]);
-        s.refresh();
-        assert_eq!(s.rows.len(), 2);
-
-        s.set_query("git".into());
-        assert_eq!(s.rows, vec!["a"]);
-
-        s.set_query("ALICE".into());
-        assert_eq!(s.rows, vec!["b"]);
-
-        s.set_query("nothing matches this".into());
-        assert!(s.rows.is_empty());
-    }
-
-    #[test]
-    fn blank_query_returns_everything() {
-        let mut s = state_with(vec![idx_entry("a", "A", "u", 1), idx_entry("b", "B", "u", 2)]);
-        s.refresh();
-        s.set_query("   ".into());
-        assert_eq!(s.rows.len(), 2);
-    }
-
-    #[test]
-    fn selection_is_preserved_by_id_when_the_filter_changes() {
-        let mut s = state_with(vec![
-            idx_entry("a", "Alpha", "u", 300),
-            idx_entry("b", "Beta", "u", 200),
-            idx_entry("c", "Gamma", "u", 100),
-        ]);
-        s.refresh();
-        s.move_selection(2);
-        assert_eq!(s.selected_id().as_deref(), Some("c"));
-
-        // "gam" still matches the selected row, so the cursor stays put.
-        s.set_query("gam".into());
-        assert_eq!(s.selected_id().as_deref(), Some("c"));
-    }
-
-    #[test]
-    fn selection_falls_back_to_the_top_when_the_filter_drops_the_row() {
-        // "a" is newest so it sorts to the top, making the row order explicit
-        // rather than assumed.
-        let mut s = state_with(vec![idx_entry("b", "Beta", "u", 1), idx_entry("a", "Alpha", "u", 2)]);
-        s.refresh();
-        assert_eq!(s.rows, vec!["a", "b"]);
-        assert_eq!(s.selected_id().as_deref(), Some("a"));
-
-        s.move_selection(1);
-        assert_eq!(s.selected_id().as_deref(), Some("b"), "cursor moved to the second row");
-
-        // "alpha" only matches "a", so the selected row is filtered out and the
-        // cursor must land somewhere valid instead of pointing at a stale index.
-        s.set_query("alpha".into());
-        assert_eq!(s.rows, vec!["a"]);
-        assert_eq!(s.selected, 0);
-        assert_eq!(s.selected_id().as_deref(), Some("a"));
-    }
-
-    #[test]
-    fn selection_never_points_past_the_end_of_a_shrunk_list() {
-        let entries: Vec<IndexEntry> =
-            (0..10).map(|i| idx_entry(&format!("id{i}"), &format!("Item {i}"), "u", 100 - i)).collect();
-        let mut s = state_with(entries);
-        s.refresh();
-        s.move_selection(9);
-        assert_eq!(s.selected, 9);
-
-        // Narrow to a single matching row.
-        s.set_query("Item 7".into());
-        assert_eq!(s.rows.len(), 1);
-        assert!(s.selected < s.rows.len(), "selection {} out of range", s.selected);
-        assert!(s.selected_id().is_some());
-    }
-
-    #[test]
-    fn favorites_filter_narrows_the_list() {
-        let mut s = state_with(vec![idx_entry("a", "Alpha", "u", 2)]);
-        s.session.as_mut().unwrap().index.entries[0].favorite = true;
-        s.session.as_mut().unwrap().index.entries.push(idx_entry("b", "Beta", "u", 1));
-        s.refresh();
-        assert_eq!(s.rows.len(), 2);
-
-        s.set_filter(Filter::Favorites);
-        assert_eq!(s.rows, vec!["a"]);
-        assert!(s.filter.is_narrowed());
-        assert!(Filter::All.label() == "All");
-
-        // Toggling off returns the full list.
-        s.toggle_favorite_filter();
-        assert_eq!(s.rows.len(), 2);
-        assert!(!s.filter.is_narrowed());
-    }
-
-    #[test]
-    fn tag_filter_narrows_the_list() {
-        let mut s = state_with(vec![idx_entry("a", "Alpha", "u", 2)]);
-        // Entries carry tag *ids*, so the index needs a tag for the id to
-        // resolve to. This is the shape `save_form` produces.
-        s.session.as_mut().unwrap().index.tags = vec![domi_core::vault::Tag {
-            id: "t-work".into(),
-            name: "work".into(),
-            updated_at: 0,
-            deleted: false,
-        }];
-        s.session.as_mut().unwrap().index.entries[0].tags = vec!["t-work".into()];
-        s.session.as_mut().unwrap().index.entries.push(idx_entry("b", "Beta", "u", 1));
-        s.refresh();
-
-        s.set_filter(Filter::Tag { id: "t-work".into(), name: "work".into() });
-        assert_eq!(s.rows, vec!["a"]);
-        assert_eq!(s.filter.label(), "#work");
-    }
-
-    #[test]
-    fn search_composes_with_a_filter() {
-        let mut s = state_with(vec![idx_entry("a", "Alpha", "u", 3)]);
-        s.session.as_mut().unwrap().index.entries[0].favorite = true;
-        s.session.as_mut().unwrap().index.entries[0].tags = vec!["work".into()];
-        let mut other = idx_entry("b", "Beta", "u", 2);
-        other.favorite = true;
-        other.tags = vec!["home".into()];
-        s.session.as_mut().unwrap().index.entries.push(other);
-        s.refresh();
-
-        s.set_filter(Filter::Favorites);
-        assert_eq!(s.rows.len(), 2);
-        // Only one of the two favorites matches.
-        s.set_query("alp".into());
-        assert_eq!(s.rows, vec!["a"]);
-    }
-
-    #[test]
-    fn movement_clamps_at_both_ends() {
-        let mut s = state_with(vec![
-            idx_entry("a", "A", "u", 3),
-            idx_entry("b", "B", "u", 2),
-            idx_entry("c", "C", "u", 1),
-        ]);
-        s.refresh();
-        s.move_selection(-1);
-        assert_eq!(s.selected, 0, "cannot move above the first row");
-
-        s.move_selection(99);
-        assert_eq!(s.selected, 2, "cannot move below the last row");
-        assert_eq!(s.selected_id().as_deref(), Some("c"));
-    }
-
-    #[test]
-    fn movement_on_an_empty_list_is_harmless() {
-        let mut s = state_with(vec![]);
-        s.refresh();
-        s.move_selection(1);
-        s.move_selection(-1);
-        assert_eq!(s.selected, 0);
-        assert!(s.rows.is_empty());
-    }
-
-    #[test]
-    fn scroll_keeps_the_selection_inside_the_window() {
-        let entries: Vec<IndexEntry> =
-            (0..20).map(|i| idx_entry(&format!("id{i}"), &format!("T{i}"), "u", 100 - i)).collect();
-        let mut s = state_with(entries);
-        s.refresh();
-
-        s.selected = 15;
-        s.clamp_scroll(10);
-        assert!(s.selected >= s.offset, "selection {} above offset {}", s.selected, s.offset);
-        assert!(s.selected < s.offset + 10);
-
-        s.selected = 1;
-        s.clamp_scroll(10);
-        assert!(s.offset <= s.selected, "offset {} left the selection above the window", s.offset);
-    }
-
-    #[test]
-    fn scroll_window_never_overshoots_a_short_list() {
-        let mut s = state_with(vec![idx_entry("a", "A", "u", 1)]);
-        s.refresh();
-        s.clamp_scroll(20);
-        assert_eq!(s.offset, 0);
-        s.clamp_scroll(0);
-        assert_eq!(s.offset, 0);
-    }
-
-    #[test]
-    fn field_cycling_wraps_in_both_directions() {
-        assert_eq!(Field::Title.next(), Field::Username);
-        assert_eq!(Field::Tags.next(), Field::Title, "next wraps forward");
-        assert_eq!(Field::Title.prev(), Field::Tags, "prev wraps backward");
-        assert_eq!(Field::ALL.len(), 9);
-        for f in Field::ALL {
-            assert!(!f.label().is_empty());
-        }
-    }
-
-    #[test]
-    fn new_form_starts_on_title_and_is_marked_new() {
-        let form = EntryForm::new(0);
-        assert!(form.is_new());
-        assert_eq!(form.field, Field::Title);
-        assert!(!form.reveal, "secrets start hidden");
-    }
-
-    #[test]
-    fn form_text_borrow_and_write_follow_the_focused_field() {
-        let mut form = EntryForm::new(0);
-        form.field = Field::Username;
-        form.set_text("octocat".into());
-        assert_eq!(form.text(), "octocat");
-        assert_eq!(form.username, "octocat");
-        assert_eq!(form.title, "", "only the focused field changed");
-
-        form.field = Field::Notes;
-        form.set_text("line one".into());
-        assert_eq!(form.notes, "line one");
-    }
-
-    #[test]
-    fn toggles_have_no_editable_text() {
-        let mut form = EntryForm::new(0);
-        form.field = Field::Favorite;
-        assert_eq!(form.text(), "");
-        form.set_text("ignored".into());
-        assert!(!form.favorite);
-    }
-
-    #[test]
-    fn category_cycles_through_every_variant_and_returns() {
-        let mut form = EntryForm::new(0);
-        // Default is Login; the first entry is it so the cycle is anchored.
-        assert_eq!(form.category, ItemCategory::Login);
-        let start = form.category;
-        let mut seen = vec![start];
-        // One cycle per remaining variant, then one more to wrap home.
-        for _ in 0..all_categories().len() {
-            form.cycle_category();
-            seen.push(form.category);
-        }
-        assert_eq!(form.category, start, "cycling once per variant returns to the start");
-        // Every variant was visited exactly once before the wrap.
-        for (i, category) in all_categories().iter().enumerate() {
-            assert_eq!(seen.get(i), Some(category), "seen: {seen:?}");
-        }
-    }
-
-    #[test]
-    fn favorite_toggles() {
-        let mut form = EntryForm::new(0);
-        assert!(!form.favorite);
-        form.toggle_favorite();
-        assert!(form.favorite);
-        form.toggle_favorite();
-        assert!(!form.favorite);
-    }
-
-    #[test]
-    fn tag_field_splits_and_trims() {
-        let mut form = EntryForm::new(0);
-        form.tags = " work , home ,, ".into();
-        assert_eq!(form.tag_list(), vec!["work", "home"]);
-    }
-
-    #[test]
-    fn form_validation_requires_a_title() {
-        let mut form = EntryForm::new(0);
-        assert!(form.validate().is_err());
-        form.title = "   ".into();
-        assert!(form.validate().is_err());
-        form.title = "GitHub".into();
-        assert!(form.validate().is_ok());
-    }
-
-    #[test]
-    fn form_validation_rejects_an_absurd_title_or_notes() {
-        let mut form = EntryForm::new(0);
-        form.title = "x".repeat(201);
-        assert!(form.validate().is_err());
-        form.title = "x".repeat(200);
-        assert!(form.validate().is_ok());
-
-        form.notes = "y".repeat(10_001);
-        assert!(form.validate().is_err());
-        form.notes = "y".repeat(10_000);
-        assert!(form.validate().is_ok());
-    }
-
-    #[test]
-    fn form_round_trips_an_existing_entry() {
-        let mut entry = crate::vault_store::blank_entry("abc".into(), 100);
-        entry.title = "GitHub".into();
-        entry.username = "octocat".into();
-        entry.password = "hunter2".into();
-        entry.url = "github.com".into();
-        entry.notes = "work account".into();
-        entry.totp_secret = Some("JBSWY3DPEHPK3PXP".into());
-        // An entry holds tag ids, so the form is given the id/name pairs it
-        // needs to render something a person typed.
-        entry.tags = vec!["t-work".into()];
-        entry.favorite = true;
-
-        let form = EntryForm::from_entry(&entry, &[("t-work".into(), "work".into())]);
-        assert!(!form.is_new());
-        assert_eq!(form.title, "GitHub");
-        assert_eq!(form.tags, "work", "the form shows the name, not the id");
-
-        let round_tripped = form.to_entry("abc".into(), 200, vec!["t-work".into()]);
-        assert_eq!(round_tripped.title, "GitHub");
-        assert_eq!(round_tripped.password, "hunter2");
-        assert_eq!(round_tripped.tags, vec!["t-work"]);
-        assert_eq!(round_tripped.totp_secret.as_deref(), Some("JBSWY3DPEHPK3PXP"));
-        assert!(round_tripped.favorite);
-        assert_eq!(round_tripped.updated_at, 200);
-    }
-
-    #[test]
-    fn a_tag_id_with_no_name_shows_as_the_id_rather_than_vanishing() {
-        let mut entry = crate::vault_store::blank_entry("abc".into(), 0);
-        entry.title = "T".into();
-        entry.tags = vec!["gone".into()];
-
-        // A tag deleted out from under an entry must stay visible, so the user
-        // sees the reference and can remove it instead of wondering where the
-        // tag went.
-        let form = EntryForm::from_entry(&entry, &[]);
-        assert_eq!(form.tags, "gone");
-    }
-
-    #[test]
-    fn an_empty_totp_becomes_none_not_an_empty_string() {
-        let mut form = EntryForm::new(0);
-        form.title = "T".into();
-        form.totp = "   ".into();
-        assert!(form.to_entry("id".into(), 0, Vec::new()).totp_secret.is_none());
-    }
-
-    #[test]
-    fn generator_defaults_are_valid_and_produce_a_password() {
-        let opts = GeneratorOptions::default();
-        assert!(opts.validate().is_ok());
-        let pw = opts.generate().unwrap();
-        assert_eq!(pw.chars().count(), opts.length);
-    }
-
-    #[test]
-    fn generator_rejects_zero_length_and_no_character_classes() {
-        let bad_len = GeneratorOptions { length: 0, ..Default::default() };
-        assert!(bad_len.validate().is_err());
-
-        let no_classes = GeneratorOptions {
-            uppercase: false,
-            lowercase: false,
-            numbers: false,
-            symbols: false,
-            ..Default::default()
-        };
-        assert!(no_classes.validate().is_err());
-    }
-
-    #[test]
-    fn generator_reports_a_readable_message() {
-        let bad = GeneratorOptions { length: 9999, ..Default::default() };
-        match bad.generate() {
-            Err(AppError::BadInput(msg)) => assert!(msg.contains("Length")),
-            other => panic!("expected BadInput, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn modal_labels_and_constructor_intent() {
-        let safe = Modal::confirm("Change password", "This re-encrypts everything.");
-        match &safe {
-            Modal::Confirm { danger, yes_label, .. } => {
-                assert!(!danger);
-                assert_eq!(yes_label, "Confirm");
+    fn a_short_settings_window_scrolls_to_keep_the_cursor_on_screen() {
+        for capacity in 1..SETTINGS_ROWS {
+            for cursor in 0..SETTINGS_ROWS {
+                let offset = settings_window(cursor, capacity);
+                assert!(
+                    offset <= cursor && cursor < offset + capacity,
+                    "cursor {cursor} off screen at capacity {capacity} (offset {offset})"
+                );
+                // And the window never starts past the end of the list.
+                assert!(offset + capacity <= SETTINGS_ROWS || capacity == 1, "capacity {capacity}");
             }
-            other => panic!("expected Confirm, got {other:?}"),
-        }
-
-        let risky = Modal::danger("Delete entry", "This cannot be undone.");
-        match &risky {
-            Modal::Confirm { danger, yes_label, .. } => {
-                assert!(danger);
-                assert_eq!(yes_label, "Delete");
-            }
-            other => panic!("expected Confirm, got {other:?}"),
-        }
-        assert!(risky.blocks_input());
-        assert!(!risky.title().is_empty());
-    }
-
-    #[test]
-    fn idle_timer_triggers_only_after_the_threshold() {
-        let mut s = state_with(vec![idx_entry("a", "A", "u", 1)]);
-        s.auto_lock_secs = 100;
-        assert!(!s.tick_idle(40));
-        assert!(!s.tick_idle(50), "90s is still under the threshold");
-        assert_eq!(s.idle_secs, 90);
-        assert!(s.tick_idle(10), "reaching 100s requests a lock");
-    }
-
-    #[test]
-    fn touching_resets_the_idle_timer() {
-        let mut s = state_with(vec![idx_entry("a", "A", "u", 1)]);
-        s.auto_lock_secs = 100;
-        s.tick_idle(90);
-        s.touch();
-        assert_eq!(s.idle_secs, 0);
-        assert!(!s.tick_idle(50));
-    }
-
-    #[test]
-    fn idle_timer_is_inert_while_locked_or_disabled() {
-        let mut s = app_state(VaultPaths::new("/tmp/nope"));
-        s.auto_lock_secs = 1;
-        assert!(!s.tick_idle(10_000), "no session, so nothing to protect");
-
-        let mut unlocked = state_with(vec![]);
-        unlocked.auto_lock_secs = 0;
-        assert!(!unlocked.tick_idle(10_000), "auto-lock disabled");
-    }
-
-    #[test]
-    fn lock_clears_plaintext_and_returns_to_unlock() {
-        let mut s = state_with(vec![idx_entry("a", "A", "u", 1)]);
-        s.query = "searching".into();
-        s.reveal = true;
-        s.password = "master".into();
-        s.focus = Focus::Detail;
-        s.screen = Screen::Vault;
-
-        s.lock();
-
-        assert!(s.session.is_none());
-        assert!(s.detail.is_none());
-        assert!(s.form.is_none());
-        assert!(s.rows.is_empty());
-        assert!(s.query.is_empty());
-        assert!(!s.reveal);
-        assert_eq!(s.focus, Focus::List);
-        assert_eq!(s.screen, Screen::Unlock);
-        assert_eq!(s.idle_secs, 0);
-    }
-
-    #[test]
-    fn notify_resets_idle_and_records_the_message() {
-        let mut s = app_state(VaultPaths::new("/tmp/nope"));
-        s.idle_secs = 500;
-        s.notify(Status::success("Saved"));
-        assert_eq!(s.idle_secs, 0);
-        assert_eq!(s.status.unwrap().text, "Saved");
-    }
-
-    #[test]
-    fn notify_error_uses_the_friendly_message() {
-        let mut s = app_state(VaultPaths::new("/tmp/nope"));
-        s.notify_error(AppError::WrongPassword);
-        let st = s.status.unwrap();
-        assert_eq!(st.kind, StatusKind::Error);
-        assert!(st.text.contains("password"));
-    }
-
-    #[test]
-    fn modal_open_reflects_the_modal_slot() {
-        let mut s = app_state(VaultPaths::new("/tmp/nope"));
-        assert!(!s.modal_open());
-        s.modal = Some(Modal::danger("t", "b"));
-        assert!(s.modal_open());
-    }
-
-    #[test]
-    fn status_messages_carry_their_kind_and_time() {
-        assert_eq!(Status::info("i").kind, StatusKind::Info);
-        assert_eq!(Status::success("s").kind, StatusKind::Success);
-        assert_eq!(Status::error("e").kind, StatusKind::Error);
-        assert!(Status::info("i").at > 0);
-    }
-
-    // ------------------------------------------------------------- actions
-
-    /// A state pointed at a fresh, empty temp vault.
-    fn fresh_state() -> AppState {
-        let dir = std::env::temp_dir().join(format!("domi-act-{}-{:?}", std::process::id(), std::thread::current().id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        app_state(VaultPaths::new(&dir))
-    }
-
-    /// A state with a real unlocked vault on disk.
-    fn unlocked_state() -> AppState {
-        let mut s = fresh_state();
-        s.kdf = crate::vault_store::test_params();
-        s.create_vault("correct horse", "correct horse").expect("vault should create");
-        s
-    }
-
-    #[test]
-    fn create_vault_then_unlock_lands_on_the_vault_screen() {
-        let mut s = fresh_state();
-        s.kdf = crate::vault_store::test_params();
-        assert_eq!(s.screen, Screen::Unlock);
-
-        s.create_vault("pw", "pw").unwrap();
-        assert_eq!(s.screen, Screen::Vault);
-        assert!(s.session.is_some());
-        assert!(s.password.is_empty(), "the typed password is wiped after use");
-        assert!(s.confirm.is_empty());
-
-        // The vault is on disk, so a fresh state starts on Unlock and can
-        // reopen it.
-        let mut reopened = app_state(s.paths.clone());
-        reopened.kdf = crate::vault_store::test_params();
-        assert_eq!(reopened.initial_screen(), Screen::Unlock);
-        reopened.unlock("pw").unwrap();
-        assert_eq!(reopened.screen, Screen::Vault);
-    }
-
-    #[test]
-    fn create_vault_rejects_a_mismatched_confirmation() {
-        let mut s = fresh_state();
-        s.kdf = crate::vault_store::test_params();
-        match s.create_vault("one", "two") {
-            Err(AppError::BadInput(msg)) => assert!(msg.contains("match")),
-            other => panic!("expected a mismatch error, got {other:?}"),
-        }
-        assert!(s.session.is_none(), "nothing should be created");
-        assert!(!s.paths.exists());
-    }
-
-    #[test]
-    fn create_vault_rejects_an_empty_password() {
-        let mut s = fresh_state();
-        s.kdf = crate::vault_store::test_params();
-        assert!(s.create_vault("", "").is_err());
-        assert!(!s.paths.exists());
-    }
-
-    #[test]
-    fn create_vault_refuses_to_overwrite() {
-        let mut s = unlocked_state();
-        match s.create_vault("other", "other") {
-            Err(AppError::VaultExists) => {}
-            other => panic!("expected VaultExists, got {other:?}"),
         }
     }
 
+    /// A capacity of zero means a pane too short for even one row, which still
+    /// has to produce a usable window rather than underflow.
     #[test]
-    fn unlock_with_the_wrong_password_reports_a_friendly_error() {
-        let paths = unlocked_state().paths.clone();
-        let mut s = app_state(paths);
-        match s.unlock("nope") {
-            Err(AppError::WrongPassword) => {}
-            other => panic!("expected WrongPassword, got {other:?}"),
-        }
-        assert_eq!(s.screen, Screen::Unlock, "a failed unlock stays on the unlock screen");
+    fn a_settings_window_of_zero_is_clamped_to_one_row() {
+        assert_eq!(settings_window(0, 0), 0);
+        assert_eq!(settings_window(ROW_RESET, 0), ROW_RESET);
     }
 
+    /// The window only scrolls once the cursor passes the bottom edge, so the
+    /// first rows stay put on a tall terminal with the cursor near the top.
     #[test]
-    fn new_entry_round_trips_through_disk() {
-        let mut s = unlocked_state();
-        s.begin_new_entry();
-        assert_eq!(s.screen, Screen::Edit);
+    fn a_settings_window_still_shows_the_first_rows_until_the_cursor_demands_otherwise() {
+        assert_eq!(settings_window(ROW_VAULT, 3), 0);
+        assert_eq!(settings_window(ROW_AUTO_LOCK, 3), 0);
+        assert_eq!(settings_window(ROW_MASTER_PASSWORD, 3), 1);
+        assert_eq!(settings_window(ROW_RESET, 3), 2);
+    }
 
+    /// An unlocked vault holding one saved entry.
+    fn unlocked_with_entry() -> (TempVault, AppState) {
+        let (tmp, mut state) = app_state();
+        state.kdf = crate::vault_store::test_params();
+        state.create_vault("correct horse", "correct horse").expect("the vault is created");
+        state.begin_new();
         {
-            let form = s.form.as_mut().unwrap();
+            let form = state.form.as_mut().expect("the editor is open");
             form.title = "GitHub".into();
-            form.username = "octocat".into();
+            form.username = "ada".into();
             form.password = "hunter2".into();
+            form.url = "https://github.com".into();
         }
-        s.save_form().unwrap();
-
-        assert_eq!(s.screen, Screen::Vault);
-        assert_eq!(s.rows.len(), 1);
-        assert_eq!(s.selected_title(), "GitHub");
-        // The decrypted detail is available without a manual reload.
-        assert_eq!(s.detail.as_ref().unwrap().password, "hunter2");
-
-        // And it survives a real reopen from disk.
-        let paths = s.paths.clone();
-        drop(s);
-        let mut again = app_state(paths);
-        again.unlock("correct horse").unwrap();
-        assert_eq!(again.rows.len(), 1);
-        assert_eq!(again.selected_title(), "GitHub");
+        state.save_form().expect("the entry saves");
+        (tmp, state)
     }
 
-    #[test]
-    fn saving_a_form_without_a_title_is_refused() {
-        let mut s = unlocked_state();
-        s.begin_new_entry();
-        s.form.as_mut().unwrap().title = "  ".into();
-        match s.save_form() {
-            Err(AppError::BadInput(msg)) => assert!(msg.contains("Title")),
-            other => panic!("expected a validation error, got {other:?}"),
-        }
-        assert_eq!(s.screen, Screen::Edit, "stays on the form so the user can fix it");
-        assert!(s.form.is_some());
-    }
-
-    #[test]
-    fn editing_an_entry_updates_it_rather_than_duplicating() {
-        let mut s = unlocked_state();
-        s.begin_new_entry();
-        s.form.as_mut().unwrap().title = "Old".into();
-        s.save_form().unwrap();
-
-        s.begin_edit_selected();
-        assert_eq!(s.screen, Screen::Edit);
-        assert!(!s.form.as_ref().unwrap().is_new());
-        s.form.as_mut().unwrap().title = "New".into();
-        s.save_form().unwrap();
-
-        assert_eq!(s.rows.len(), 1, "editing must not create a second row");
-        assert_eq!(s.selected_title(), "New");
-    }
-
-    #[test]
-    fn cancel_edit_discards_changes() {
-        let mut s = unlocked_state();
-        s.begin_new_entry();
-        s.form.as_mut().unwrap().title = "Discarded".into();
-        s.cancel_edit();
-        assert_eq!(s.screen, Screen::Vault);
-        assert!(s.form.is_none());
-        assert!(s.rows.is_empty(), "a cancelled new entry is not saved");
-    }
-
-    #[test]
-    fn generate_fills_the_form_and_reveals_it() {
-        let mut s = unlocked_state();
-        s.begin_new_entry();
-        s.generate_password_into_form();
-        let form = s.form.as_ref().unwrap();
-        assert_eq!(form.password.chars().count(), s.generator.length);
-        assert!(form.reveal, "a just-generated password is shown");
-        assert_eq!(form.field, Field::Password, "focus lands on the new password");
-    }
-
-    #[test]
-    fn generate_respects_invalid_options_without_touching_the_form() {
-        let mut s = unlocked_state();
-        s.begin_new_entry();
-        s.form.as_mut().unwrap().password = "keep".into();
-        s.generator.length = 9999;
-        s.generate_password_into_form();
-        assert_eq!(s.form.as_ref().unwrap().password, "keep", "bad options change nothing");
-        assert_eq!(s.status.unwrap().kind, StatusKind::Error);
-    }
-
-    #[test]
-    fn toggle_favorite_persists_through_a_reopen() {
-        let mut s = unlocked_state();
-        s.begin_new_entry();
-        s.form.as_mut().unwrap().title = "Starred".into();
-        s.save_form().unwrap();
-        assert!(!s.selected_index_entry().unwrap().favorite);
-
-        s.toggle_selected_favorite();
-        assert!(s.selected_index_entry().unwrap().favorite);
-
-        let paths = s.paths.clone();
-        drop(s);
-        let mut again = app_state(paths);
-        again.unlock("correct horse").unwrap();
-        assert!(again.selected_index_entry().unwrap().favorite, "favorite survived the reopen");
-    }
-
-    #[test]
-    fn delete_removes_the_row_and_the_entry_from_the_index() {
-        let mut s = unlocked_state();
-        s.begin_new_entry();
-        s.form.as_mut().unwrap().title = "Doomed".into();
-        s.save_form().unwrap();
-        assert_eq!(s.rows.len(), 1);
-
-        s.delete_selected();
-        assert!(s.rows.is_empty());
-        assert!(s.status.as_ref().unwrap().text.contains("Doomed"));
-
-        let paths = s.paths.clone();
-        drop(s);
-        let mut again = app_state(paths);
-        again.unlock("correct horse").unwrap();
-        assert!(again.rows.is_empty(), "the delete was persisted");
-    }
-
-    #[test]
-    fn copy_queues_the_password_and_reports_success() {
-        let mut s = unlocked_state();
-        s.begin_new_entry();
-        {
-            let f = s.form.as_mut().unwrap();
-            f.title = "Copy".into();
-            f.password = "hunter2".into();
-        }
-        s.save_form().unwrap();
-        s.pending_copy = None;
-
-        s.copy_password();
-        assert_eq!(s.pending_copy.as_deref(), Some("hunter2"));
-        assert_eq!(s.status.unwrap().kind, StatusKind::Success);
-    }
-
-    #[test]
-    fn copy_of_a_missing_secret_reports_instead_of_queueing_empty() {
-        let mut s = unlocked_state();
-        s.begin_new_entry();
-        s.form.as_mut().unwrap().title = "No secret".into();
-        s.save_form().unwrap();
-        s.pending_copy = None;
-
-        s.copy_password();
-        assert!(s.pending_copy.is_none(), "nothing is copied");
-        assert_eq!(s.status.unwrap().kind, StatusKind::Error);
-    }
-
-    #[test]
-    fn reveal_toggles_and_resets_on_lock() {
-        let mut s = unlocked_state();
-        s.begin_new_entry();
-        s.form.as_mut().unwrap().password = "hunter2".into();
-
-        s.toggle_reveal();
-        assert!(s.reveal, "reveal is app-level state");
-        assert!(s.form.as_ref().unwrap().reveal, "and it propagates to the form");
-
-        s.toggle_reveal();
-        assert!(!s.reveal);
-        assert!(!s.form.as_ref().unwrap().reveal);
-
-        s.toggle_reveal();
-        s.lock();
-        assert!(!s.reveal, "locking always hides secrets");
-    }
-
-    #[test]
-    fn change_master_password_then_reopen_with_the_new_one() {
-        let mut s = unlocked_state();
-        s.begin_new_entry();
-        s.form.as_mut().unwrap().title = "Kept".into();
-        s.save_form().unwrap();
-
-        s.change_master_password("brand new secret", "brand new secret").unwrap();
-
-        let paths = s.paths.clone();
-        drop(s);
-
-        // The old password no longer works.
-        let mut stale = app_state(paths.clone());
-        assert!(stale.unlock("correct horse").is_err());
-
-        let mut fresh = app_state(paths);
-        fresh.kdf = crate::vault_store::test_params();
-        fresh.unlock("brand new secret").unwrap();
-        assert_eq!(fresh.rows.len(), 1, "entries survive the rekey");
-        assert_eq!(fresh.selected_title(), "Kept");
-    }
-
-    #[test]
-    fn change_master_password_validates_its_inputs() {
-        let mut s = unlocked_state();
-        assert!(s.change_master_password("a", "b").is_err(), "mismatch");
-        assert!(s.change_master_password("", "").is_err(), "empty");
-    }
-
-    #[test]
-    fn dismissing_a_modal_clears_it() {
-        let mut s = unlocked_state();
-        s.modal = Some(Modal::Password { title: "t".into(), value: "secret".into() });
-        assert!(s.modal_open());
-        s.dismiss_modal();
-        assert!(!s.modal_open());
-    }
-
-    // ------------------------------------------------- preferences round trip
-
-    /// A scratch preferences file, removed on drop so a failing test cannot
-    /// leave it behind for the next run to trip over.
-    struct ScratchConfig(PathBuf);
-
-    impl ScratchConfig {
-        fn new(name: &str) -> Self {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static N: AtomicU32 = AtomicU32::new(0);
-            let n = N.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir()
-                .join(format!("domi-prefs-{name}-{}-{n}", std::process::id()))
-                .join("config.toml");
-            let _ = std::fs::remove_dir_all(path.parent().unwrap());
-            ScratchConfig(path)
-        }
-
-        fn path(&self) -> PathBuf {
-            self.0.clone()
-        }
-    }
-
-    impl Drop for ScratchConfig {
-        fn drop(&mut self) {
-            if let Some(dir) = self.0.parent() {
-                let _ = std::fs::remove_dir_all(dir);
+    /// An unlocked vault holding two titled entries, "First" and "Second".
+    fn unlocked_with_two_entries() -> (TempVault, AppState) {
+        let (tmp, mut state) = app_state();
+        state.kdf = crate::vault_store::test_params();
+        state.create_vault("correct horse", "correct horse").expect("the vault is created");
+        for (title, password) in [("First", "one"), ("Second", "two")] {
+            state.begin_new();
+            if let Some(form) = state.form.as_mut() {
+                form.title = title.into();
+                form.password = password.into();
             }
+            state.save_form().expect("the entry saves");
         }
+        state.move_selection(0);
+        (tmp, state)
     }
 
-    /// A state pointed at a scratch vault and a scratch config file.
-    fn state_with_config(name: &str) -> (AppState, ScratchConfig) {
-        let cfg = ScratchConfig::new(name);
-        let vault = std::env::temp_dir().join(format!("domi-prefs-vault-{name}"));
-        let s = AppState::with_config_file(VaultPaths::new(&vault), cfg.path());
-        (s, cfg)
+    // ------------------------------------------------------------- opening
+
+    #[test]
+    fn a_fresh_vault_opens_on_setup_and_an_existing_one_on_unlock() {
+        let (tmp, mut state) = app_state();
+        assert_eq!(state.initial_screen(), Screen::Setup);
+
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("manifest.json"), "{}").unwrap();
+        assert_eq!(state.initial_screen(), Screen::Unlock);
     }
 
     #[test]
-    fn a_saved_vault_dir_is_read_back_by_the_next_run() {
-        let (mut s, cfg) = state_with_config("readback");
-        s.set_vault_dir("/srv/domi-vault").expect("should save");
-
-        // A fresh launch resolves its state the same way production does.
-        let next = AppState::with_config_file(
-            VaultPaths::new("/tmp/irrelevant"),
-            cfg.path(),
-        );
-        let saved = Config::load_from(&cfg.path()).expect("should load");
-        assert_eq!(saved.vault_dir(), Some("/srv/domi-vault"));
-        // The vault the app actually opens comes from VaultPaths, which reads
-        // the same key, so assert on that value being non-empty to prove the
-        // path resolved and the run constructed cleanly.
-        assert!(!next.paths.root().as_os_str().is_empty());
-    }
-
-    #[test]
-    fn a_saved_auto_lock_delay_survives_a_restart() {
-        let (mut s, cfg) = state_with_config("autolock");
-        // Start from a known value so the default is not what is being tested.
-        assert_eq!(s.auto_lock_secs, 15 * 60, "the untouched default");
-        s.step_auto_lock(1);
-        let chosen = s.auto_lock_secs;
-        assert_ne!(chosen, 15 * 60, "the step should have changed it");
-
-        let next = AppState::with_config_file(
-            VaultPaths::new("/tmp/irrelevant"),
-            cfg.path(),
-        );
-        assert_eq!(next.auto_lock_secs, chosen, "the saved delay should be in force");
-    }
-
-    #[test]
-    fn changing_the_delay_does_not_delete_a_saved_vault_dir() {
-        // Read-modify-write, not a fresh struct: the two settings are written
-        // by different code paths and must not clobber each other.
-        let (mut s, cfg) = state_with_config("both");
-        s.set_vault_dir("/srv/keep-me").expect("save the path");
-        s.step_auto_lock(1);
-
-        let saved = Config::load_from(&cfg.path()).expect("should load");
-        assert_eq!(saved.vault_dir(), Some("/srv/keep-me"), "the vault dir must survive");
-        assert!(saved.auto_lock_secs.is_some(), "the delay should be saved too");
-    }
-
-    #[test]
-    fn saving_a_vault_dir_keeps_the_delay_already_on_disk() {
-        // The two writers must not clobber each other: set the delay, persist
-        // it, then save a path and confirm the delay is still what it was.
-        let (mut s, cfg) = state_with_config("keepdelay");
-        s.auto_lock_secs = 1800;
-        s.step_auto_lock(1); // 1800 -> 3600, persisted by the step
-        let persisted = s.auto_lock_secs;
-
-        s.set_vault_dir("/srv/other").expect("save the path");
-
-        let saved = Config::load_from(&cfg.path()).expect("should load");
-        assert_eq!(saved.vault_dir(), Some("/srv/other"));
-        assert_eq!(saved.auto_lock_secs, Some(persisted), "the delay must not reset");
-    }
-
-    #[test]
-    fn a_blank_vault_dir_is_refused_and_writes_nothing() {
-        let (mut s, cfg) = state_with_config("blank");
-        let err = s.set_vault_dir("   ").expect_err("blank should be refused");
-        assert!(matches!(err, AppError::BadInput(_)), "got {err:?}");
-        assert!(
-            !cfg.path().exists(),
-            "a refused path must not create a config file"
-        );
-    }
-
-    #[test]
-    fn a_file_is_refused_as_a_vault_directory() {
-        let (mut s, cfg) = state_with_config("isfile");
-        // The parent has to exist before the file can be created in it; the
-        // config dir is only made by the first save.
-        std::fs::create_dir_all(cfg.path().parent().unwrap()).unwrap();
-        let file = cfg.path().with_file_name("not-a-dir");
-        std::fs::write(&file, b"x").unwrap();
-
-        let err = s
-            .set_vault_dir(file.to_str().unwrap())
-            .expect_err("a file is not a vault directory");
+    fn creating_a_vault_mismatched_passwords_is_refused() {
+        let (_tmp, mut state) = app_state();
+        state.kdf = crate::vault_store::test_params();
+        let err = state.create_vault("one", "two").expect_err("the passwords differ");
         assert!(matches!(err, AppError::BadInput(_)), "got {err:?}");
     }
 
     #[test]
-    fn a_vault_dir_is_trimmed_before_it_is_written() {
-        let (mut s, cfg) = state_with_config("trim");
-        s.set_vault_dir("  /srv/padded  ").expect("should save");
-        let saved = Config::load_from(&cfg.path()).expect("load");
-        assert_eq!(saved.vault_dir(), Some("/srv/padded"), "whitespace is not part of a path");
+    fn a_typed_password_is_zeroized_once_the_vault_opens() {
+        let (_tmp, mut state) = app_state();
+        state.kdf = crate::vault_store::test_params();
+        state.password = "correct horse".into();
+        state.confirm = "correct horse".into();
+        state.create_vault("correct horse", "correct horse").unwrap();
+        assert!(state.password.is_empty(), "the password should not linger in state");
+        assert_eq!(state.screen, Screen::Vault);
     }
 
     #[test]
-    fn an_unreadable_config_does_not_stop_the_app_from_starting() {
-        // A broken preferences file must never be fatal: the user would be
-        // locked out of their own vault over a typo in a text file.
-        let cfg = ScratchConfig::new("broken");
-        if let Some(parent) = cfg.path().parent() {
-            std::fs::create_dir_all(parent).unwrap();
+    fn the_wrong_password_is_refused_and_the_screen_does_not_change() {
+        let (tmp, mut state) = app_state();
+        state.kdf = crate::vault_store::test_params();
+        state.create_vault("correct horse", "correct horse").unwrap();
+        state.lock();
+        assert_eq!(state.screen, Screen::Unlock);
+
+        let err = state.unlock("wrong").expect_err("that password is wrong");
+        assert!(matches!(err, AppError::WrongPassword), "got {err:?}");
+        assert_eq!(state.screen, Screen::Unlock);
+        assert!(state.session.is_none());
+        drop(tmp);
+    }
+
+    // ---------------------------------------------------------------- list
+
+    #[test]
+    fn a_saved_entry_shows_up_in_the_list() {
+        let (_tmp, state) = unlocked_with_entry();
+        assert_eq!(state.filtered_count(), 1);
+        assert_eq!(state.row_label(0).0, "GitHub");
+    }
+
+    #[test]
+    fn the_search_query_narrows_the_list() {
+        let (_tmp, mut state) = unlocked_with_entry();
+        state.set_query("git".into());
+        assert_eq!(state.filtered_count(), 1);
+        state.set_query("nothing matches".into());
+        assert_eq!(state.filtered_count(), 0);
+    }
+
+    #[test]
+    fn clearing_the_query_brings_every_entry_back() {
+        let (_tmp, mut state) = unlocked_with_entry();
+        state.set_query("zzz".into());
+        assert_eq!(state.filtered_count(), 0);
+        state.set_query(String::new());
+        assert_eq!(state.filtered_count(), 1);
+    }
+
+    #[test]
+    fn the_favorites_filter_hides_everything_until_one_is_marked() {
+        let (_tmp, mut state) = unlocked_with_entry();
+        state.toggle_filter();
+        assert_eq!(state.filtered_count(), 0, "nothing is a favorite yet");
+        state.toggle_filter();
+
+        state.toggle_favorite();
+        state.toggle_filter();
+        assert_eq!(state.filtered_count(), 1, "the entry just became a favorite");
+    }
+
+    #[test]
+    fn the_selection_stays_on_the_same_entry_after_filtering() {
+        let (_tmp, mut state) = unlocked_with_entry();
+        state.begin_new();
+        if let Some(form) = state.form.as_mut() {
+            form.title = "Zebra".into();
+            form.password = "x".into();
         }
-        std::fs::write(cfg.path(), "this is not = toml\n").unwrap();
+        state.save_form().unwrap();
+        assert_eq!(state.filtered_count(), 2);
 
-        let s = AppState::with_config_file(VaultPaths::new("/tmp/irrelevant"), cfg.path());
-        assert_eq!(s.auto_lock_secs, 15 * 60, "falls back to the default");
+        // Select the second entry, then filter down to one and back.
+        state.move_selection(1);
+        let picked = state.selected_id();
+        state.set_query("zebra".into());
+        assert_eq!(state.filtered_count(), 1);
+        state.set_query(String::new());
+        assert_eq!(state.selected_id(), picked, "filtering should not lose the selection");
     }
 
     #[test]
-    fn the_vault_dir_dialog_opens_seeded_with_the_current_path() {
-        let mut s = AppState::with_config_file(
-            VaultPaths::new("/srv/current-vault"),
-            ScratchConfig::new("seed").path(),
+    fn the_detail_pane_follows_the_selection() {
+        // The pane used to keep whatever entry was loaded at unlock, so moving
+        // the cursor showed the previous entry's password.
+        let (_tmp, mut state) = unlocked_with_two_entries();
+        assert_eq!(state.detail().map(|e| e.title.as_str()), Some("First"));
+
+        state.move_selection(1);
+        assert_eq!(state.detail().map(|e| e.title.as_str()), Some("Second"));
+
+        state.move_selection(-1);
+        assert_eq!(state.detail().map(|e| e.title.as_str()), Some("First"));
+    }
+
+    #[test]
+    fn the_detail_pane_follows_the_selection_through_a_filter_change() {
+        let (_tmp, mut state) = unlocked_with_two_entries();
+        state.set_query("second".into());
+        assert_eq!(
+            state.detail().map(|e| e.title.as_str()),
+            Some("Second"),
+            "filtering moved the selection, so the pane must follow"
         );
-        s.begin_vault_dir_change();
-        let Some(Modal::Text { value, .. }) = s.modal.as_ref() else {
-            panic!("expected a text modal, got {:?}", s.modal);
-        };
-        assert_eq!(value, "/srv/current-vault", "seeded so the user edits, not retypes");
+
+        state.set_query("nothing matches".into());
+        assert!(state.detail().is_none(), "an empty list shows nothing");
     }
 
     #[test]
-    fn a_text_modal_accepts_typing_and_backspace() {
-        let mut m = Modal::Text { title: "t".into(), value: "/a".into() };
-        assert!(m.push_char('b'));
-        assert_eq!(m.text_value(), Some("/ab"));
-        assert!(m.pop_char());
-        assert_eq!(m.text_value(), Some("/a"));
-
-        // A confirm has no field, so the helpers report no change.
-        let mut c = Modal::confirm("t", "b");
-        assert!(!c.push_char('x'));
-        assert!(!c.pop_char());
-        assert_eq!(c.text_value(), None);
+    fn moving_past_the_end_of_the_list_stops_at_the_end() {
+        let (_tmp, mut state) = unlocked_with_entry();
+        state.move_selection(1_000);
+        assert_eq!(state.selected, 0, "there is only one entry");
+        state.move_selection(-1_000);
+        assert_eq!(state.selected, 0);
     }
 
     #[test]
-    fn a_test_state_never_writes_to_the_real_config_file() {
-        // Regression guard. `AppState::new` points at the real
-        // `~/.config/domi/config.toml`, so every test builds its state through
-        // `app_state` instead. If someone reaches for `AppState::new` in a
-        // test, stepping a setting here would overwrite the developer's real
-        // preferences and leave the next launch behaving differently.
-        let s = app_state(VaultPaths::new("/tmp/nope"));
-        assert_ne!(
-            s.config_file,
-            Config::default_file(),
-            "tests must not use the real config path"
-        );
-        // And the scratch path is inside the temp dir, not the home config dir.
-        assert!(
-            s.config_file.starts_with(std::env::temp_dir())
-                || s.config_file.starts_with("."),
-            "unexpected scratch location: {}",
-            s.config_file.display()
-        );
+    fn a_deleted_entry_leaves_the_list() {
+        let (_tmp, mut state) = unlocked_with_entry();
+        assert_eq!(state.filtered_count(), 1);
+        state.request_delete_selected();
+        // Nothing happens until the confirmation is answered.
+        assert_eq!(state.filtered_count(), 1);
+        assert!(state.modal.is_some());
+
+        state.dismiss_modal();
+        state.confirm_pending(PendingAction::DeleteEntry);
+        assert_eq!(state.filtered_count(), 0);
     }
 
-    #[test]
-    fn stepping_a_setting_through_a_test_state_leaves_no_file_on_disk() {
-        // The end-to-end version of the guard above: write, then confirm the
-        // write landed in the scratch file only.
-        let s = app_state(VaultPaths::new("/tmp/nope"));
-        let mut s = s;
-        s.step_auto_lock(1);
-        assert!(
-            s.config_file.exists(),
-            "the setting should have been written to the scratch file"
-        );
-        assert_ne!(
-            s.config_file,
-            Config::default_file(),
-            "and definitely not to the real one"
-        );
-        let _ = std::fs::remove_dir_all(s.config_file.parent().unwrap());
-    }
+    // --------------------------------------------------------------- editor
 
     #[test]
-    fn auto_lock_countdown_counts_down_and_disappears_when_off() {
-        let mut s = unlocked_state();
-        s.auto_lock_secs = 100;
-        s.idle_secs = 30;
-        assert_eq!(s.auto_lock_countdown(), Some(70));
-
-        s.auto_lock_secs = 0;
-        assert_eq!(s.auto_lock_countdown(), None, "disabled means no countdown to show");
-
-        let locked = app_state(VaultPaths::new("/tmp/nope"));
-        assert_eq!(locked.auto_lock_countdown(), None);
-    }
-
-    #[test]
-    fn new_entry_ids_are_unique() {
-        let mut ids = std::collections::HashSet::new();
-        for _ in 0..1000 {
-            assert!(ids.insert(new_entry_id()), "ids must never repeat");
+    fn the_editor_refuses_an_entry_with_no_title() {
+        let (_tmp, mut state) = unlocked_with_entry();
+        state.begin_new();
+        if let Some(form) = state.form.as_mut() {
+            form.title = "   ".into();
         }
-        assert!(ids.iter().all(|id: &String| id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit())));
+        let err = state.save_form().expect_err("a title is required");
+        assert!(matches!(err, AppError::BadInput(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn cancelling_the_editor_writes_nothing() {
+        let (_tmp, mut state) = unlocked_with_entry();
+        let before = state.filtered_count();
+        state.begin_new();
+        if let Some(form) = state.form.as_mut() {
+            form.title = "Discarded".into();
+        }
+        state.cancel_form();
+        assert_eq!(state.filtered_count(), before);
+        assert_eq!(state.screen, Screen::Vault);
+        assert!(state.form.is_none());
+    }
+
+    #[test]
+    fn editing_an_entry_updates_it_rather_than_adding_one() {
+        let (_tmp, mut state) = unlocked_with_entry();
+        state.begin_edit();
+        assert!(state.form.as_ref().expect("the editor is open").is_edit());
+        if let Some(form) = state.form.as_mut() {
+            form.username = "grace".into();
+        }
+        state.save_form().unwrap();
+        assert_eq!(state.filtered_count(), 1, "still one entry");
+        assert_eq!(state.row_label(0).1, "grace");
+    }
+
+    #[test]
+    fn a_password_field_never_stores_its_plaintext_in_the_title() {
+        let (_tmp, mut state) = unlocked_with_entry();
+        state.begin_new();
+        let form = state.form.as_mut().expect("the editor is open");
+
+        // Typing lands in whichever field has focus, and nowhere else.
+        form.insert_char(Field::Title, 'G');
+        assert_eq!(form.title, "G");
+        assert_eq!(form.password, "");
+
+        form.focused = Field::Password;
+        form.insert_char(Field::Password, 'x');
+        assert_eq!(form.password, "x");
+        assert_eq!(form.title, "G", "the title must not have grown");
+    }
+
+    #[test]
+    fn tabs_never_reach_the_non_text_fields() {
+        let (_tmp, mut state) = unlocked_with_entry();
+        state.begin_new();
+        let form = state.form.as_mut().expect("the editor is open");
+        form.focused = Field::Favorite;
+        assert!(!Field::Favorite.is_text());
+        form.focused = Field::Tags;
+        assert!(Field::Tags.is_text());
+    }
+
+    // -------------------------------------------------------------- secrets
+
+    #[test]
+    fn revealing_is_off_by_default_and_only_toggles_when_asked() {
+        let (_tmp, mut state) = unlocked_with_entry();
+        assert!(!state.reveal);
+        state.toggle_reveal();
+        assert!(state.reveal);
+    }
+
+    #[test]
+    fn locking_clears_the_loaded_entry_and_the_typed_password() {
+        let (_tmp, mut state) = unlocked_with_entry();
+        state.password = "leftover".into();
+        state.load_detail();
+        assert!(state.detail.is_some());
+
+        state.lock();
+        assert!(state.detail.is_none());
+        assert!(state.password.is_empty());
+        assert!(state.session.is_none());
+        assert_eq!(state.screen, Screen::Unlock);
+    }
+
+    #[test]
+    fn copying_queues_the_secret_and_reports_the_size_it_copied() {
+        let (_tmp, mut state) = unlocked_with_entry();
+        state.load_detail();
+        state.copy_password();
+        let queued = state.pending_copy.take().expect("a copy is queued");
+        assert_eq!(queued, "hunter2");
+        assert!(crate::clipboard::is_supported_size(&queued));
+    }
+
+    // ------------------------------------------------------------ auto-lock
+
+    #[test]
+    fn auto_lock_fires_once_the_idle_delay_has_passed() {
+        let (_tmp, mut state) = unlocked_with_entry();
+        state.auto_lock_secs = 60;
+        assert!(!state.tick_idle(30), "halfway there is nothing to do");
+        assert!(state.session.is_some());
+        assert!(state.tick_idle(31), "the delay has now passed");
+        assert!(state.session.is_none());
+        assert_eq!(state.screen, Screen::Unlock);
+    }
+
+    #[test]
+    fn any_keystroke_pushes_the_auto_lock_back_out() {
+        let (_tmp, mut state) = unlocked_with_entry();
+        state.auto_lock_secs = 60;
+        state.tick_idle(50);
+        state.note_activity();
+        assert!(!state.tick_idle(30), "the countdown restarted");
+    }
+
+    #[test]
+    fn an_auto_lock_delay_of_zero_never_locks_the_vault() {
+        let (_tmp, mut state) = unlocked_with_entry();
+        state.auto_lock_secs = 0;
+        assert!(!state.tick_idle(100_000));
+        assert!(state.session.is_some());
+    }
+
+    #[test]
+    fn the_countdown_reads_as_whole_minutes_and_hours() {
+        assert_eq!(auto_lock_label(0), "off");
+        assert_eq!(auto_lock_label(60), "1 minute");
+        assert_eq!(auto_lock_label(900), "15 minutes");
+        assert_eq!(auto_lock_label(3600), "1 hour");
+        assert_eq!(auto_lock_label(21600), "6 hours");
+    }
+
+    #[test]
+    fn stepping_the_auto_lock_delay_lands_on_a_preset() {
+        let (_tmp, mut state) = app_state();
+        for _ in AppState::AUTO_LOCK_STEPS {
+            assert!(AppState::AUTO_LOCK_STEPS.contains(&state.auto_lock_secs));
+            state.step_auto_lock(1);
+            assert!(
+                AppState::AUTO_LOCK_STEPS.contains(&state.auto_lock_secs),
+                "got {}",
+                state.auto_lock_secs
+            );
+        }
+    }
+
+    // ------------------------------------------------------------- settings
+
+    #[test]
+    fn the_settings_cursor_cannot_leave_the_screen() {
+        let (_tmp, mut state) = app_state();
+        state.move_settings_row(-5);
+        assert_eq!(state.settings_row, 0);
+        state.move_settings_row(999);
+        assert_eq!(state.settings_row, SETTINGS_ROWS - 1);
+    }
+
+    #[test]
+    fn changing_the_vault_directory_persists_it_to_the_config_file() {
+        let (_tmp, mut state) = app_state();
+        let dir = std::env::temp_dir().join("domi-moved-vault");
+        state.set_vault_dir(dir.to_str().unwrap()).expect("the directory is saved");
+
+        let saved = Config::load_from(&state.config_file).expect("the config parses");
+        assert_eq!(saved.vault_dir(), Some(dir.to_str().unwrap()));
+    }
+
+    #[test]
+    fn saving_the_auto_lock_delay_keeps_the_vault_directory_already_on_disk() {
+        // The two settings are written by different code paths; a blind
+        // rewrite of the whole file would drop whichever one the user set
+        // earlier in the session.
+        let (_tmp, mut state) = app_state();
+        let dir = std::env::temp_dir().join("domi-kept-vault");
+        state.set_vault_dir(dir.to_str().unwrap()).unwrap();
+
+        state.step_auto_lock(1);
+        let saved = Config::load_from(&state.config_file).expect("the config parses");
+        assert_eq!(saved.vault_dir(), Some(dir.to_str().unwrap()), "the directory survived");
+        assert!(saved.auto_lock_secs.is_some(), "the delay was written too");
+    }
+
+    #[test]
+    fn a_blank_vault_directory_is_refused_rather_than_written() {
+        let (_tmp, mut state) = app_state();
+        let err = state.set_vault_dir("   ").expect_err("a blank path is not a directory");
+        assert!(matches!(err, AppError::BadInput(_)), "got {err:?}");
+    }
+
+    // ----------------------------------------------------------- the wipe
+
+    #[test]
+    fn resetting_a_vault_erases_every_entry() {
+        let (tmp, mut state) = unlocked_with_entry();
+        state.request_reset_vault();
+        assert!(state.modal.is_some(), "a reset asks first");
+
+        state.dismiss_modal();
+        state.confirm_pending(PendingAction::ResetVault);
+        assert_eq!(state.filtered_count(), 0);
+
+        // And the vault is still usable afterwards.
+        state.begin_new();
+        if let Some(form) = state.form.as_mut() {
+            form.title = "After the wipe".into();
+            form.password = "y".into();
+        }
+        state.save_form().expect("the vault still takes entries");
+        assert_eq!(state.filtered_count(), 1);
+        drop(tmp);
+    }
+
+    #[test]
+    fn a_reset_removes_the_entry_blobs_from_disk() {
+        let (tmp, mut state) = unlocked_with_entry();
+        let entries_dir = tmp.path().join("entries");
+        let before = std::fs::read_dir(&entries_dir).expect("the entries dir exists").count();
+        assert!(before > 0);
+
+        state.confirm_pending(PendingAction::ResetVault);
+        let after = std::fs::read_dir(&entries_dir).expect("the entries dir survives").count();
+        assert_eq!(after, 0, "the ciphertext should be gone, not just hidden");
+    }
+
+    // ------------------------------------------------------------ generator
+
+    #[test]
+    fn generating_produces_a_password_of_the_requested_length() {
+        let (_tmp, mut state) = unlocked_with_entry();
+        state.begin_new();
+        if let Some(form) = state.form.as_mut() {
+            form.generator.length = 32;
+        }
+        state.generate_password().expect("generation succeeds");
+        let password = state.form.as_ref().expect("the editor is open").password.clone();
+        assert_eq!(password.chars().count(), 32);
+    }
+
+    #[test]
+    fn a_generator_with_no_character_classes_is_refused() {
+        let (_tmp, mut state) = unlocked_with_entry();
+        state.begin_new();
+        if let Some(form) = state.form.as_mut() {
+            form.generator.uppercase = false;
+            form.generator.lowercase = false;
+            form.generator.numbers = false;
+            form.generator.symbols = false;
+        }
+        let err = state.generate_password().expect_err("an empty charset cannot generate");
+        assert!(matches!(err, AppError::BadInput(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_generator_length_out_of_range_is_clamped_rather_than_refused() {
+        let (_tmp, mut state) = unlocked_with_entry();
+        state.begin_new();
+        if let Some(form) = state.form.as_mut() {
+            form.generator.length = 10_000;
+        }
+        state.generate_password().expect("the length is clamped into range");
+        let password = state.form.as_ref().expect("the editor is open").password.clone();
+        assert_eq!(
+            password.chars().count(),
+            domi_core::password::MAX_PASSWORD_LENGTH
+        );
     }
 }

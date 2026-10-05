@@ -121,7 +121,8 @@ mod tests {
 
     #[test]
     fn the_refusal_message_is_user_readable() {
-        let err = copy(&"a".repeat(MAX_PAYLOAD_BYTES + 1), |_| {}).unwrap_err();
+        let err = copy(&"a".repeat(MAX_PAYLOAD_BYTES + 1), |_| {})
+            .expect_err("should refuse");
         assert!(err.chars().all(|c| !c.is_uppercase() || c.is_ascii_uppercase()));
         assert!(!err.contains('\n'), "an error here must fit one line: {err}");
     }

@@ -29,14 +29,16 @@
 //! The vault path can be set in two places, plus the default. They are
 //! consulted in this order and the first that yields a value wins:
 //!
-//! 1. `DOMI_VAULT_DIR` — for one-off runs and scripted use.
-//! 2. This file's `vault-dir`.
+//! 1. This file's `vault-dir`.
+//! 2. `DOMI_VAULT_DIR` — for one-off runs and scripted use.
 //! 3. The platform default (`~/.local/share/domi/vault` on Linux).
 //!
-//! The environment variable wins deliberately. It is set deliberately, at run
-//! time, for one run, and a user who exports it expects it honoured for that
-//! run. A stale file from a previous session should not silently override an
-//! explicit request made seconds ago.
+//! This file wins deliberately. A setting written by the settings screen is an
+//! explicit, durable request that should survive every later run. Letting a
+//! leftover shell export silently outrank it means the app appears to ignore
+//! its own saved preference, which is the more surprising failure of the two.
+//! `DOMI_VAULT_DIR` remains the fallback for anyone who only ever points at a
+//! vault from the command line.
 //!
 //! # Malformed files
 //!
@@ -107,9 +109,8 @@ impl Config {
         };
         let text = String::from_utf8(bytes)
             .map_err(|_| AppError::Storage(format!("{}: not valid UTF-8", path.display())))?;
-        toml::from_str(&text).map_err(|e| {
-            AppError::Storage(format!("{}: {e}", path.display()))
-        })
+        toml::from_str(&text)
+            .map_err(|e| AppError::Storage(format!("{}: {e}", path.display())))
     }
 
     /// Writes the config to `path`, creating the directory if needed.
@@ -126,16 +127,14 @@ impl Config {
             fs::create_dir_all(parent)
                 .map_err(|e| AppError::Storage(format!("{}: {e}", parent.display())))?;
         }
-        let text = toml::to_string_pretty(self)
-            .map_err(|e| AppError::Storage(format!("config: {e}")))?;
+        let text =
+            toml::to_string_pretty(self).map_err(|e| AppError::Storage(format!("config: {e}")))?;
         // A comment at the top of the file, so anyone opening it knows what
         // it is and that editing it by hand is safe.
-        let header = format!(
-            "# Domi preferences. Safe to edit by hand.\n\
-             # vault-dir is ignored when DOMI_VAULT_DIR is set.\n\n"
-        );
+        let header = "# Domi preferences. Safe to edit by hand.\n\
+                      # vault-dir takes precedence over DOMI_VAULT_DIR.\n\n";
         let tmp = path.with_extension("toml.tmp");
-        fs::write(&tmp, header + &text)
+        fs::write(&tmp, header.to_string() + &text)
             .map_err(|e| AppError::Storage(format!("{}: {e}", tmp.display())))?;
         fs::rename(&tmp, path)
             .map_err(|e| AppError::Storage(format!("{}: {e}", path.display())))?;
@@ -185,26 +184,41 @@ mod tests {
 
     /// A unique scratch path per test, so parallel tests cannot collide.
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("domi-config-test-{name}"));
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "domi-config-{name}-{}-{n}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         dir.join(FILE_NAME)
     }
 
+    /// Removes the scratch directory a test created.
+    fn cleanup(path: &Path) {
+        if let Some(dir) = path.parent() {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
     #[test]
     fn a_missing_file_loads_the_defaults_rather_than_failing() {
-        let cfg = Config::load_from(&scratch("missing")).expect("a missing file is the first-run case");
+        let cfg = Config::load_from(&scratch("missing"))
+            .expect("a missing file is the first-run case");
         assert_eq!(cfg, Config::default());
     }
 
     #[test]
     fn a_saved_config_round_trips() {
         let path = scratch("roundtrip");
-        let cfg = Config { vault_dir: Some("/srv/vault".into()), auto_lock_secs: Some(3600) };
+        let cfg =
+            Config { vault_dir: Some("/srv/vault".into()), auto_lock_secs: Some(3600) };
         cfg.save_to(&path).expect("should save");
 
         let loaded = Config::load_from(&path).expect("should load");
         assert_eq!(loaded, cfg);
-        let _ = fs::remove_dir_all(path.parent().unwrap());
+        cleanup(&path);
     }
 
     #[test]
@@ -219,23 +233,24 @@ mod tests {
         assert!(text.contains("vault-dir"), "not kebab-case:\n{text}");
         assert!(text.contains("auto-lock-secs"), "not kebab-case:\n{text}");
         assert!(text.contains("Domi preferences"), "missing the header comment:\n{text}");
-        // Re-parse the written text as a document, which is the same thing the
-        // loader does, so a file that reads back cleanly here reads back
-        // cleanly in production too.
+        // Re-parse through the real loader, so a file that reads back cleanly
+        // here reads back cleanly in production too.
         let parsed: toml::Table = toml::from_str(&text).expect("valid TOML");
         assert_eq!(parsed["vault-dir"].as_str(), Some("/srv/vault"));
         // auto-lock-secs = 0 must survive as 0, not be dropped as falsy.
         assert_eq!(parsed["auto-lock-secs"].as_integer(), Some(0));
-        let _ = fs::remove_dir_all(path.parent().unwrap());
+        cleanup(&path);
     }
 
     #[test]
     fn auto_lock_off_is_preserved_rather_than_reported_as_unset() {
         let path = scratch("off");
-        Config { vault_dir: None, auto_lock_secs: Some(0) }.save_to(&path).expect("save");
+        Config { vault_dir: None, auto_lock_secs: Some(0) }
+            .save_to(&path)
+            .expect("save");
         let loaded = Config::load_from(&path).expect("load");
         assert_eq!(loaded.auto_lock_secs, Some(0), "0 means off, not unset");
-        let _ = fs::remove_dir_all(path.parent().unwrap());
+        cleanup(&path);
     }
 
     #[test]
@@ -249,7 +264,7 @@ mod tests {
         let cfg = Config::load_from(&path).expect("a file with one key is valid");
         assert_eq!(cfg.vault_dir(), Some("/tmp/mine"));
         assert_eq!(cfg.auto_lock_secs, None, "an absent key means use the default");
-        let _ = fs::remove_dir_all(path.parent().unwrap());
+        cleanup(&path);
     }
 
     #[test]
@@ -260,7 +275,7 @@ mod tests {
         }
         fs::write(&path, "").unwrap();
         assert_eq!(Config::load_from(&path).expect("empty TOML is valid"), Config::default());
-        let _ = fs::remove_dir_all(path.parent().unwrap());
+        cleanup(&path);
     }
 
     #[test]
@@ -275,7 +290,7 @@ mod tests {
         let err = Config::load_from(&path).expect_err("malformed TOML must be reported");
         assert!(matches!(err, AppError::Storage(_)), "got {err:?}");
         assert_eq!(fs::read_to_string(&path).unwrap(), original, "a bad file must survive");
-        let _ = fs::remove_dir_all(path.parent().unwrap());
+        cleanup(&path);
     }
 
     #[test]
@@ -291,7 +306,7 @@ mod tests {
             Config::load_from(&path).is_err(),
             "an unknown key should be reported, not ignored"
         );
-        let _ = fs::remove_dir_all(path.parent().unwrap());
+        cleanup(&path);
     }
 
     #[test]
@@ -311,7 +326,7 @@ mod tests {
         assert!(!path.parent().unwrap().exists());
         Config::default().save_to(&path).expect("should create the parent");
         assert!(path.exists(), "the file should exist after saving");
-        let _ = fs::remove_dir_all(path.parent().unwrap());
+        cleanup(&path);
     }
 
     #[test]
@@ -354,6 +369,6 @@ mod tests {
         // not happen is a panic that takes the vault UI down with it.
         let outcome = Config::load_from(&path);
         assert!(outcome.is_ok() || outcome.is_err());
-        let _ = fs::remove_dir_all(path.parent().unwrap());
+        cleanup(&path);
     }
 }
