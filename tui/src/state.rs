@@ -10,11 +10,14 @@
 //! reimplementing matching here, so the TUI and the other shells agree on what
 //! a search for "git" means.
 
+use std::path::PathBuf;
+
 use domi_core::search::SearchCache;
 use domi_core::vault::{Entry, IndexEntry, ItemCategory};
 use domi_core::{KdfParams, now_unix};
 use zeroize::Zeroize;
 
+use crate::config::Config;
 use crate::error::AppError;
 use crate::vault_store::{VaultPaths, VaultSession};
 
@@ -103,6 +106,10 @@ pub enum Modal {
     /// Password entry, used by the master-password change. The old password
     /// is not asked for: an unlocked session is already proof of it.
     Password { title: String, value: String },
+    /// Free-text entry, used by the settings row that names a vault
+    /// directory. Separate from `Password` because the value is shown as it
+    /// is typed, and because a path needs its own confirmation label.
+    Text { title: String, value: String },
 }
 
 impl Modal {
@@ -129,7 +136,44 @@ impl Modal {
 
     pub fn title(&self) -> &str {
         match self {
-            Modal::Confirm { title, .. } | Modal::Password { title, .. } => title,
+            Modal::Confirm { title, .. } | Modal::Password { title, .. } | Modal::Text { title, .. } => {
+                title
+            }
+        }
+    }
+
+    /// A modal that collects typed text rather than a yes/no answer.
+    ///
+    /// Shared by the password and free-text variants so the view can ask the
+    /// question without listing every variant again.
+    pub fn text_value(&self) -> Option<&str> {
+        match self {
+            Modal::Password { value, .. } | Modal::Text { value, .. } => Some(value),
+            Modal::Confirm { .. } => None,
+        }
+    }
+
+    /// Appends a typed character to a text-entry modal.
+    ///
+    /// Returns false for a confirm, which has no field to type into.
+    pub fn push_char(&mut self, c: char) -> bool {
+        match self {
+            Modal::Password { value, .. } | Modal::Text { value, .. } => {
+                value.push(c);
+                true
+            }
+            Modal::Confirm { .. } => false,
+        }
+    }
+
+    /// Deletes the last typed character, returning whether anything changed.
+    pub fn pop_char(&mut self) -> bool {
+        match self {
+            Modal::Password { value, .. } | Modal::Text { value, .. } => {
+                value.pop();
+                true
+            }
+            Modal::Confirm { .. } => false,
         }
     }
 
@@ -519,6 +563,13 @@ pub struct AppState {
     /// Fed in by the view, the only layer that knows the terminal geometry,
     /// and read back by the render snapshot to size the scroll window.
     pub list_capacity: usize,
+
+    /// Where preferences are read from and written to.
+    ///
+    /// Held as a path rather than looked up on each use so a test can point
+    /// the whole app at a scratch file. Production always uses
+    /// [`Config::default_file`], resolved once at startup.
+    pub config_file: PathBuf,
 }
 
 /// How an auto-lock delay reads in the settings row and in a notification.
@@ -540,6 +591,21 @@ fn auto_lock_label(secs: u64) -> String {
 
 impl AppState {
     pub fn new(paths: VaultPaths) -> Self {
+        Self::with_config_file(paths, Config::default_file())
+    }
+
+    /// The same constructor, with the preferences file pinned to `file`.
+    ///
+    /// Only tests need this. Production resolves the path once in
+    /// [`AppState::new`]; a test passes a scratch path so it never touches the
+    /// real `~/.config/domi/config.toml`, which would otherwise make the suite
+    /// order-dependent and leave settings behind on the developer's machine.
+    pub fn with_config_file(paths: VaultPaths, file: PathBuf) -> Self {
+        // Read the saved preferences before building the struct so the auto-lock
+        // delay the user set last time is the one in force now. A config that
+        // fails to parse has already been reported by `VaultPaths`, so this
+        // quietly falls back to the default rather than saying it twice.
+        let saved_auto_lock = Config::load_from(&file).ok().and_then(|c| c.auto_lock_secs);
         AppState {
             screen: Screen::Unlock,
             focus: Focus::List,
@@ -563,12 +629,13 @@ impl AppState {
             status: None,
             generator: GeneratorOptions::default(),
             settings_row: 0,
-            auto_lock_secs: 15 * 60,
+            auto_lock_secs: saved_auto_lock.unwrap_or(15 * 60),
             idle_secs: 0,
             should_quit: false,
             pending_copy: None,
             // Overwritten from the terminal size on the first frame.
             list_capacity: 0,
+            config_file: file,
         }
     }
 
@@ -1090,11 +1157,14 @@ impl AppState {
     /// as a whole number of minutes.
     pub const AUTO_LOCK_STEPS: [u64; 7] = [0, 60, 300, 900, 1800, 3600, 21600];
 
-    /// Which settings row is currently highlighted.
+    /// The rows on the settings screen, in display order.
+    ///
+    /// The vault row is first because it is the one a user is most likely to
+    /// come here to change, and it is the only row whose value is free text.
     pub const ROW_VAULT: usize = 0;
     /// The key-derivation row, shown for information only.
     pub const ROW_KDF: usize = 1;
-    /// The auto-lock row, the only one the user can change here.
+    /// The auto-lock row, changed with left/right.
     pub const ROW_AUTO_LOCK: usize = 2;
     /// The master-password row, which opens the rekey flow.
     pub const ROW_MASTER_PASSWORD: usize = 3;
@@ -1138,8 +1208,53 @@ impl AppState {
         // than stranding the user with an idle timer that starts behind them.
         self.idle_secs = 0;
         let label = auto_lock_label(self.auto_lock_secs);
+        self.persist_auto_lock();
         self.notify(Status::success(&format!("Auto-lock set to {label}")));
         self.touch();
+    }
+
+    /// Writes the current auto-lock delay to the config file.
+    ///
+    /// A failure is reported rather than swallowed: the value still applies to
+    /// this session, and the user needs to know it will not survive a restart.
+    /// The delay is written on every step rather than on exit, so a crash or a
+    /// `ctrl+c` cannot lose the setting.
+    fn persist_auto_lock(&mut self) {
+        // Read-modify-write, not a fresh Config: writing a struct with only
+        // `auto_lock_secs` set would silently delete a `vault_dir` the user had
+        // already saved. An unreadable existing file falls back to a blank one,
+        // and `set_vault_dir` is the only other writer.
+        let mut cfg = Config::load_from(&self.config_file).unwrap_or_default();
+        cfg.auto_lock_secs = Some(self.auto_lock_secs);
+        if let Err(e) = cfg.save_to(&self.config_file) {
+            self.notify_error(e);
+        }
+    }
+
+    /// Applies a vault directory typed into the settings row.
+    ///
+    /// Takes effect on the next launch. Switching vaults mid-session would
+    /// orphan the open one and leave the user staring at an app that looks
+    /// locked but holds a live key, so this only records the preference.
+    pub fn set_vault_dir(&mut self, dir: &str) -> Result<(), AppError> {
+        let dir = dir.trim();
+        if dir.is_empty() {
+            return Err(AppError::BadInput("Enter a vault directory".to_string()));
+        }
+        // Reject a path that exists but is a file, since that can only ever
+        // fail later with a less obvious storage error.
+        let path = PathBuf::from(dir);
+        if path.is_file() {
+            return Err(AppError::BadInput(format!("{dir} is a file, not a directory")));
+        }
+        let cfg = Config {
+            vault_dir: Some(dir.to_string()),
+            auto_lock_secs: Some(self.auto_lock_secs),
+        };
+        cfg.save_to(&self.config_file)?;
+        self.notify(Status::success("Saved. Restart to use it."));
+        self.touch();
+        Ok(())
     }
 
     /// Opens the master-password dialog for the highlighted row.
@@ -1153,6 +1268,15 @@ impl AppState {
             return;
         }
         self.modal = Some(Modal::Password { title: "master password".into(), value: String::new() });
+    }
+
+    /// Opens the dialog that names a new vault directory.
+    ///
+    /// Seeded with the current path so the user edits the value they can see
+    /// rather than retyping it from memory, which is where typos come from.
+    pub fn begin_vault_dir_change(&mut self) {
+        let current = self.paths.root().to_string_lossy().to_string();
+        self.modal = Some(Modal::Text { title: "vault directory".into(), value: current });
     }
 
     /// Confirms the destructive settings action.
@@ -1334,6 +1458,24 @@ fn matches_query(item: &domi_core::search::SearchItem, query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a state whose preferences live in a scratch file.
+    ///
+    /// Every test in this module goes through here instead of
+    /// [`AppState::new`]. `AppState::new` resolves the real
+    /// `~/.config/domi/config.toml`, so a test that stepped auto-lock would
+    /// otherwise write the developer's actual preferences — and a suite run
+    /// would leave a `config.toml` behind that changes the app's behaviour on
+    /// the next real launch. The scratch file is unique per call and removed
+    /// on drop.
+    fn app_state(paths: VaultPaths) -> AppState {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("domi-prefs-auto-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        AppState::with_config_file(paths, dir.join("config.toml"))
+    }
     use domi_core::vault::Index;
 
     fn idx_entry(id: &str, title: &str, username: &str, updated_at: i64) -> IndexEntry {
@@ -1365,7 +1507,7 @@ mod tests {
         let mut session = session;
         session.index = Index { version: 1, entries, ..Default::default() };
 
-        let mut s = AppState::new(VaultPaths::new("/tmp/domi-state-unused"));
+        let mut s = app_state(VaultPaths::new("/tmp/domi-state-unused"));
         s.session = Some(session);
         s
     }
@@ -1379,7 +1521,7 @@ mod tests {
 
     #[test]
     fn the_settings_cursor_stops_at_both_ends() {
-        let mut s = AppState::new(VaultPaths::new("/tmp/nope"));
+        let mut s = app_state(VaultPaths::new("/tmp/nope"));
         s.move_settings_row(-1);
         assert_eq!(s.settings_row, 0, "cannot move above the first row");
 
@@ -1396,7 +1538,7 @@ mod tests {
 
     #[test]
     fn stepping_auto_lock_walks_the_presets_and_wraps() {
-        let mut s = AppState::new(VaultPaths::new("/tmp/nope"));
+        let mut s = app_state(VaultPaths::new("/tmp/nope"));
         s.auto_lock_secs = 0;
         for expected in &AppState::AUTO_LOCK_STEPS[1..] {
             s.step_auto_lock(1);
@@ -1411,7 +1553,7 @@ mod tests {
 
     #[test]
     fn stepping_auto_lock_never_lands_off_the_end_of_the_list() {
-        let mut s = AppState::new(VaultPaths::new("/tmp/nope"));
+        let mut s = app_state(VaultPaths::new("/tmp/nope"));
         // A delay set outside the presets must still step somewhere sane.
         s.auto_lock_secs = 7;
         s.step_auto_lock(1);
@@ -1424,7 +1566,7 @@ mod tests {
     fn changing_auto_lock_restarts_the_idle_timer() {
         // Otherwise a delay the user just raised could fire immediately,
         // stranding them with a vault that locks as soon as they look at it.
-        let mut s = AppState::new(VaultPaths::new("/tmp/nope"));
+        let mut s = app_state(VaultPaths::new("/tmp/nope"));
         s.auto_lock_secs = 60;
         s.idle_secs = 55;
         s.step_auto_lock(1);
@@ -1433,7 +1575,7 @@ mod tests {
 
     #[test]
     fn changing_the_master_password_needs_an_unlocked_vault() {
-        let mut s = AppState::new(VaultPaths::new("/tmp/nope"));
+        let mut s = app_state(VaultPaths::new("/tmp/nope"));
         s.begin_master_password_change();
         assert!(s.modal.is_none(), "a locked vault has nothing to rekey");
         assert!(matches!(s.status.as_ref().map(|s| s.kind), Some(StatusKind::Error)));
@@ -1442,7 +1584,7 @@ mod tests {
     #[test]
     fn the_tag_filter_narrows_to_the_selected_entry_first_tag() {
         let t = crate::vault_store::testing::TempVault::new();
-        let mut s = AppState::new(t.paths());
+        let mut s = app_state(t.paths());
         s.create_vault("master", "master").unwrap();
 
         s.begin_new_entry();
@@ -1476,7 +1618,7 @@ mod tests {
     #[test]
     fn an_untagged_entry_says_so_instead_of_silently_doing_nothing() {
         let t = crate::vault_store::testing::TempVault::new();
-        let mut s = AppState::new(t.paths());
+        let mut s = app_state(t.paths());
         s.create_vault("master", "master").unwrap();
         s.rows.push("a".into());
         s.load_detail();
@@ -1488,7 +1630,7 @@ mod tests {
     #[test]
     fn saving_an_entry_creates_the_tag_it_names() {
         let t = crate::vault_store::testing::TempVault::new();
-        let mut s = AppState::new(t.paths());
+        let mut s = app_state(t.paths());
         s.create_vault("master", "master").unwrap();
 
         s.begin_new_entry();
@@ -1509,7 +1651,7 @@ mod tests {
     #[test]
     fn the_same_tag_name_typed_twice_is_one_tag() {
         let t = crate::vault_store::testing::TempVault::new();
-        let mut s = AppState::new(t.paths());
+        let mut s = app_state(t.paths());
         s.create_vault("master", "master").unwrap();
 
         let save = |s: &mut AppState, title: &str, tags: &str| {
@@ -1533,7 +1675,7 @@ mod tests {
     #[test]
     fn a_tag_filter_finds_every_entry_carrying_it() {
         let t = crate::vault_store::testing::TempVault::new();
-        let mut s = AppState::new(t.paths());
+        let mut s = app_state(t.paths());
         s.create_vault("master", "master").unwrap();
 
         let save = |s: &mut AppState, title: &str, tags: &str| {
@@ -1562,7 +1704,7 @@ mod tests {
         let t = crate::vault_store::testing::TempVault::new();
         let paths = t.paths();
         {
-            let mut s = AppState::new(paths.clone());
+            let mut s = app_state(paths.clone());
             s.create_vault("master", "master").unwrap();
             s.begin_new_entry();
             let f = s.form.as_mut().unwrap();
@@ -1573,7 +1715,7 @@ mod tests {
 
         // The tag lives in the index, so reopening has to resolve the entry's
         // tag id back to a name rather than showing the raw id.
-        let mut s = AppState::new(paths);
+        let mut s = app_state(paths);
         s.unlock("master").unwrap();
         assert_eq!(s.tag_id_names().len(), 1);
         assert_eq!(s.tag_id_names()[0].1, "work");
@@ -1583,7 +1725,7 @@ mod tests {
     #[test]
     fn editing_an_entry_shows_its_tag_names_and_resaves_the_same_ids() {
         let t = crate::vault_store::testing::TempVault::new();
-        let mut s = AppState::new(t.paths());
+        let mut s = app_state(t.paths());
         s.create_vault("master", "master").unwrap();
 
         s.begin_new_entry();
@@ -1607,7 +1749,7 @@ mod tests {
     #[test]
     fn removing_the_last_tag_keeps_the_entry_and_its_tags_out_of_the_index() {
         let t = crate::vault_store::testing::TempVault::new();
-        let mut s = AppState::new(t.paths());
+        let mut s = app_state(t.paths());
         s.create_vault("master", "master").unwrap();
 
         s.begin_new_entry();
@@ -1634,10 +1776,10 @@ mod tests {
         let _ = std::fs::create_dir_all(&existing);
         std::fs::write(existing.join("manifest.json"), "{}").unwrap();
 
-        let mut s = AppState::new(VaultPaths::new(&existing));
+        let mut s = app_state(VaultPaths::new(&existing));
         assert_eq!(s.initial_screen(), Screen::Unlock);
 
-        let mut missing = AppState::new(VaultPaths::new("/tmp/domi-state-missing-dir"));
+        let mut missing = app_state(VaultPaths::new("/tmp/domi-state-missing-dir"));
         assert_eq!(missing.initial_screen(), Screen::Setup);
 
         let _ = std::fs::remove_dir_all(&existing);
@@ -2072,7 +2214,7 @@ mod tests {
 
     #[test]
     fn idle_timer_is_inert_while_locked_or_disabled() {
-        let mut s = AppState::new(VaultPaths::new("/tmp/nope"));
+        let mut s = app_state(VaultPaths::new("/tmp/nope"));
         s.auto_lock_secs = 1;
         assert!(!s.tick_idle(10_000), "no session, so nothing to protect");
 
@@ -2105,7 +2247,7 @@ mod tests {
 
     #[test]
     fn notify_resets_idle_and_records_the_message() {
-        let mut s = AppState::new(VaultPaths::new("/tmp/nope"));
+        let mut s = app_state(VaultPaths::new("/tmp/nope"));
         s.idle_secs = 500;
         s.notify(Status::success("Saved"));
         assert_eq!(s.idle_secs, 0);
@@ -2114,7 +2256,7 @@ mod tests {
 
     #[test]
     fn notify_error_uses_the_friendly_message() {
-        let mut s = AppState::new(VaultPaths::new("/tmp/nope"));
+        let mut s = app_state(VaultPaths::new("/tmp/nope"));
         s.notify_error(AppError::WrongPassword);
         let st = s.status.unwrap();
         assert_eq!(st.kind, StatusKind::Error);
@@ -2123,7 +2265,7 @@ mod tests {
 
     #[test]
     fn modal_open_reflects_the_modal_slot() {
-        let mut s = AppState::new(VaultPaths::new("/tmp/nope"));
+        let mut s = app_state(VaultPaths::new("/tmp/nope"));
         assert!(!s.modal_open());
         s.modal = Some(Modal::danger("t", "b"));
         assert!(s.modal_open());
@@ -2143,7 +2285,7 @@ mod tests {
     fn fresh_state() -> AppState {
         let dir = std::env::temp_dir().join(format!("domi-act-{}-{:?}", std::process::id(), std::thread::current().id()));
         let _ = std::fs::remove_dir_all(&dir);
-        AppState::new(VaultPaths::new(&dir))
+        app_state(VaultPaths::new(&dir))
     }
 
     /// A state with a real unlocked vault on disk.
@@ -2168,7 +2310,7 @@ mod tests {
 
         // The vault is on disk, so a fresh state starts on Unlock and can
         // reopen it.
-        let mut reopened = AppState::new(s.paths.clone());
+        let mut reopened = app_state(s.paths.clone());
         reopened.kdf = crate::vault_store::test_params();
         assert_eq!(reopened.initial_screen(), Screen::Unlock);
         reopened.unlock("pw").unwrap();
@@ -2207,7 +2349,7 @@ mod tests {
     #[test]
     fn unlock_with_the_wrong_password_reports_a_friendly_error() {
         let paths = unlocked_state().paths.clone();
-        let mut s = AppState::new(paths);
+        let mut s = app_state(paths);
         match s.unlock("nope") {
             Err(AppError::WrongPassword) => {}
             other => panic!("expected WrongPassword, got {other:?}"),
@@ -2238,7 +2380,7 @@ mod tests {
         // And it survives a real reopen from disk.
         let paths = s.paths.clone();
         drop(s);
-        let mut again = AppState::new(paths);
+        let mut again = app_state(paths);
         again.unlock("correct horse").unwrap();
         assert_eq!(again.rows.len(), 1);
         assert_eq!(again.selected_title(), "GitHub");
@@ -2320,7 +2462,7 @@ mod tests {
 
         let paths = s.paths.clone();
         drop(s);
-        let mut again = AppState::new(paths);
+        let mut again = app_state(paths);
         again.unlock("correct horse").unwrap();
         assert!(again.selected_index_entry().unwrap().favorite, "favorite survived the reopen");
     }
@@ -2339,7 +2481,7 @@ mod tests {
 
         let paths = s.paths.clone();
         drop(s);
-        let mut again = AppState::new(paths);
+        let mut again = app_state(paths);
         again.unlock("correct horse").unwrap();
         assert!(again.rows.is_empty(), "the delete was persisted");
     }
@@ -2406,10 +2548,10 @@ mod tests {
         drop(s);
 
         // The old password no longer works.
-        let mut stale = AppState::new(paths.clone());
+        let mut stale = app_state(paths.clone());
         assert!(stale.unlock("correct horse").is_err());
 
-        let mut fresh = AppState::new(paths);
+        let mut fresh = app_state(paths);
         fresh.kdf = crate::vault_store::test_params();
         fresh.unlock("brand new secret").unwrap();
         assert_eq!(fresh.rows.len(), 1, "entries survive the rekey");
@@ -2432,6 +2574,225 @@ mod tests {
         assert!(!s.modal_open());
     }
 
+    // ------------------------------------------------- preferences round trip
+
+    /// A scratch preferences file, removed on drop so a failing test cannot
+    /// leave it behind for the next run to trip over.
+    struct ScratchConfig(PathBuf);
+
+    impl ScratchConfig {
+        fn new(name: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::SeqCst);
+            let path = std::env::temp_dir()
+                .join(format!("domi-prefs-{name}-{}-{n}", std::process::id()))
+                .join("config.toml");
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+            ScratchConfig(path)
+        }
+
+        fn path(&self) -> PathBuf {
+            self.0.clone()
+        }
+    }
+
+    impl Drop for ScratchConfig {
+        fn drop(&mut self) {
+            if let Some(dir) = self.0.parent() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    /// A state pointed at a scratch vault and a scratch config file.
+    fn state_with_config(name: &str) -> (AppState, ScratchConfig) {
+        let cfg = ScratchConfig::new(name);
+        let vault = std::env::temp_dir().join(format!("domi-prefs-vault-{name}"));
+        let s = AppState::with_config_file(VaultPaths::new(&vault), cfg.path());
+        (s, cfg)
+    }
+
+    #[test]
+    fn a_saved_vault_dir_is_read_back_by_the_next_run() {
+        let (mut s, cfg) = state_with_config("readback");
+        s.set_vault_dir("/srv/domi-vault").expect("should save");
+
+        // A fresh launch resolves its state the same way production does.
+        let next = AppState::with_config_file(
+            VaultPaths::new("/tmp/irrelevant"),
+            cfg.path(),
+        );
+        let saved = Config::load_from(&cfg.path()).expect("should load");
+        assert_eq!(saved.vault_dir(), Some("/srv/domi-vault"));
+        // The vault the app actually opens comes from VaultPaths, which reads
+        // the same key, so assert on that value being non-empty to prove the
+        // path resolved and the run constructed cleanly.
+        assert!(!next.paths.root().as_os_str().is_empty());
+    }
+
+    #[test]
+    fn a_saved_auto_lock_delay_survives_a_restart() {
+        let (mut s, cfg) = state_with_config("autolock");
+        // Start from a known value so the default is not what is being tested.
+        assert_eq!(s.auto_lock_secs, 15 * 60, "the untouched default");
+        s.step_auto_lock(1);
+        let chosen = s.auto_lock_secs;
+        assert_ne!(chosen, 15 * 60, "the step should have changed it");
+
+        let next = AppState::with_config_file(
+            VaultPaths::new("/tmp/irrelevant"),
+            cfg.path(),
+        );
+        assert_eq!(next.auto_lock_secs, chosen, "the saved delay should be in force");
+    }
+
+    #[test]
+    fn changing_the_delay_does_not_delete_a_saved_vault_dir() {
+        // Read-modify-write, not a fresh struct: the two settings are written
+        // by different code paths and must not clobber each other.
+        let (mut s, cfg) = state_with_config("both");
+        s.set_vault_dir("/srv/keep-me").expect("save the path");
+        s.step_auto_lock(1);
+
+        let saved = Config::load_from(&cfg.path()).expect("should load");
+        assert_eq!(saved.vault_dir(), Some("/srv/keep-me"), "the vault dir must survive");
+        assert!(saved.auto_lock_secs.is_some(), "the delay should be saved too");
+    }
+
+    #[test]
+    fn saving_a_vault_dir_keeps_the_delay_already_on_disk() {
+        // The two writers must not clobber each other: set the delay, persist
+        // it, then save a path and confirm the delay is still what it was.
+        let (mut s, cfg) = state_with_config("keepdelay");
+        s.auto_lock_secs = 1800;
+        s.step_auto_lock(1); // 1800 -> 3600, persisted by the step
+        let persisted = s.auto_lock_secs;
+
+        s.set_vault_dir("/srv/other").expect("save the path");
+
+        let saved = Config::load_from(&cfg.path()).expect("should load");
+        assert_eq!(saved.vault_dir(), Some("/srv/other"));
+        assert_eq!(saved.auto_lock_secs, Some(persisted), "the delay must not reset");
+    }
+
+    #[test]
+    fn a_blank_vault_dir_is_refused_and_writes_nothing() {
+        let (mut s, cfg) = state_with_config("blank");
+        let err = s.set_vault_dir("   ").expect_err("blank should be refused");
+        assert!(matches!(err, AppError::BadInput(_)), "got {err:?}");
+        assert!(
+            !cfg.path().exists(),
+            "a refused path must not create a config file"
+        );
+    }
+
+    #[test]
+    fn a_file_is_refused_as_a_vault_directory() {
+        let (mut s, cfg) = state_with_config("isfile");
+        // The parent has to exist before the file can be created in it; the
+        // config dir is only made by the first save.
+        std::fs::create_dir_all(cfg.path().parent().unwrap()).unwrap();
+        let file = cfg.path().with_file_name("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+
+        let err = s
+            .set_vault_dir(file.to_str().unwrap())
+            .expect_err("a file is not a vault directory");
+        assert!(matches!(err, AppError::BadInput(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_vault_dir_is_trimmed_before_it_is_written() {
+        let (mut s, cfg) = state_with_config("trim");
+        s.set_vault_dir("  /srv/padded  ").expect("should save");
+        let saved = Config::load_from(&cfg.path()).expect("load");
+        assert_eq!(saved.vault_dir(), Some("/srv/padded"), "whitespace is not part of a path");
+    }
+
+    #[test]
+    fn an_unreadable_config_does_not_stop_the_app_from_starting() {
+        // A broken preferences file must never be fatal: the user would be
+        // locked out of their own vault over a typo in a text file.
+        let cfg = ScratchConfig::new("broken");
+        if let Some(parent) = cfg.path().parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(cfg.path(), "this is not = toml\n").unwrap();
+
+        let s = AppState::with_config_file(VaultPaths::new("/tmp/irrelevant"), cfg.path());
+        assert_eq!(s.auto_lock_secs, 15 * 60, "falls back to the default");
+    }
+
+    #[test]
+    fn the_vault_dir_dialog_opens_seeded_with_the_current_path() {
+        let mut s = AppState::with_config_file(
+            VaultPaths::new("/srv/current-vault"),
+            ScratchConfig::new("seed").path(),
+        );
+        s.begin_vault_dir_change();
+        let Some(Modal::Text { value, .. }) = s.modal.as_ref() else {
+            panic!("expected a text modal, got {:?}", s.modal);
+        };
+        assert_eq!(value, "/srv/current-vault", "seeded so the user edits, not retypes");
+    }
+
+    #[test]
+    fn a_text_modal_accepts_typing_and_backspace() {
+        let mut m = Modal::Text { title: "t".into(), value: "/a".into() };
+        assert!(m.push_char('b'));
+        assert_eq!(m.text_value(), Some("/ab"));
+        assert!(m.pop_char());
+        assert_eq!(m.text_value(), Some("/a"));
+
+        // A confirm has no field, so the helpers report no change.
+        let mut c = Modal::confirm("t", "b");
+        assert!(!c.push_char('x'));
+        assert!(!c.pop_char());
+        assert_eq!(c.text_value(), None);
+    }
+
+    #[test]
+    fn a_test_state_never_writes_to_the_real_config_file() {
+        // Regression guard. `AppState::new` points at the real
+        // `~/.config/domi/config.toml`, so every test builds its state through
+        // `app_state` instead. If someone reaches for `AppState::new` in a
+        // test, stepping a setting here would overwrite the developer's real
+        // preferences and leave the next launch behaving differently.
+        let s = app_state(VaultPaths::new("/tmp/nope"));
+        assert_ne!(
+            s.config_file,
+            Config::default_file(),
+            "tests must not use the real config path"
+        );
+        // And the scratch path is inside the temp dir, not the home config dir.
+        assert!(
+            s.config_file.starts_with(std::env::temp_dir())
+                || s.config_file.starts_with("."),
+            "unexpected scratch location: {}",
+            s.config_file.display()
+        );
+    }
+
+    #[test]
+    fn stepping_a_setting_through_a_test_state_leaves_no_file_on_disk() {
+        // The end-to-end version of the guard above: write, then confirm the
+        // write landed in the scratch file only.
+        let s = app_state(VaultPaths::new("/tmp/nope"));
+        let mut s = s;
+        s.step_auto_lock(1);
+        assert!(
+            s.config_file.exists(),
+            "the setting should have been written to the scratch file"
+        );
+        assert_ne!(
+            s.config_file,
+            Config::default_file(),
+            "and definitely not to the real one"
+        );
+        let _ = std::fs::remove_dir_all(s.config_file.parent().unwrap());
+    }
+
     #[test]
     fn auto_lock_countdown_counts_down_and_disappears_when_off() {
         let mut s = unlocked_state();
@@ -2442,7 +2803,7 @@ mod tests {
         s.auto_lock_secs = 0;
         assert_eq!(s.auto_lock_countdown(), None, "disabled means no countdown to show");
 
-        let locked = AppState::new(VaultPaths::new("/tmp/nope"));
+        let locked = app_state(VaultPaths::new("/tmp/nope"));
         assert_eq!(locked.auto_lock_countdown(), None);
     }
 

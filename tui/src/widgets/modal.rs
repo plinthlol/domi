@@ -120,10 +120,7 @@ pub fn ModalBox(props: &mut ModalBoxProps) -> impl Into<AnyElement<'static>> {
 
 /// Whether a modal variant needs a text input, and what it starts with.
 pub fn modal_text_value(modal: &Modal) -> Option<String> {
-    match modal {
-        Modal::Password { value, .. } => Some(value.clone()),
-        Modal::Confirm { .. } => None,
-    }
+    modal.text_value().map(str::to_string)
 }
 
 /// The confirm button's label, defaulting sensibly per variant.
@@ -131,6 +128,7 @@ pub fn modal_confirm_label(modal: &Modal) -> String {
     match modal {
         Modal::Confirm { yes_label, .. } => yes_label.clone(),
         Modal::Password { .. } => "Set".to_string(),
+        Modal::Text { .. } => "Save".to_string(),
     }
 }
 

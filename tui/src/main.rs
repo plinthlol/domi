@@ -13,6 +13,7 @@
 
 mod app;
 mod clipboard;
+mod config;
 mod error;
 mod keys;
 mod state;
@@ -59,7 +60,15 @@ async fn run() -> ExitCode {
 /// binary in Cargo.toml updates every message at once.
 const BIN_NAME: &str = env!("CARGO_BIN_NAME");
 
-/// The vault location, honouring the `DOMI_VAULT_DIR` environment variable.
+/// The program's own name, for modules that print outside this file.
+///
+/// `vault_store` reports an unreadable config before the UI exists, so it
+/// needs the name too and cannot borrow this private constant.
+pub fn bin_name() -> &'static str {
+    BIN_NAME
+}
+
+/// The vault location, honouring `DOMI_VAULT_DIR` then the config file.
 fn vault_path_from_args() -> VaultPaths {
     let mut args = std::env::args().skip(1);
     // Every arm below returns or exits, so exactly one argument is read.

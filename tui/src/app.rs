@@ -249,6 +249,14 @@ fn confirm(state: &mut AppState) {
                 state.notify_error(e);
             }
         }
+        Modal::Text { value, .. } => {
+            // The vault path is a preference, not a vault operation, so it is
+            // saved from here rather than through `save_form`.
+            state.dismiss_modal();
+            if let Err(e) = state.set_vault_dir(&value) {
+                state.notify_error(e);
+            }
+        }
     }
 }
 
@@ -471,6 +479,7 @@ fn build_modal(state: &RenderSnapshot) -> Option<AnyElement<'static>> {
     let body = match m {
         Modal::Confirm { body, .. } => body.clone(),
         Modal::Password { title, .. } => format!("Enter a new {title}."),
+        Modal::Text { .. } => "Applies the next time domish starts.".to_string(),
     };
     let detail = "esc to cancel".to_string();
     Some(build!(
@@ -504,7 +513,7 @@ fn build_field_row(label: &str, value: &str, highlight: bool) -> AnyElement<'sta
 
 /// True for the modal variants that collect typed text.
 fn is_text_modal(modal: Option<&Modal>) -> bool {
-    matches!(modal, Some(Modal::Password { .. }))
+    matches!(modal, Some(Modal::Password { .. }) | Some(Modal::Text { .. }))
 }
 
 // ------------------------------------------------------------- the six screens
@@ -848,7 +857,7 @@ fn settings_tip_element(row: usize) -> Option<AnyElement<'static>> {
 /// The hint under the highlighted settings row.
 fn settings_tip(row: usize) -> Option<&'static str> {
     match row {
-        AppState::ROW_VAULT => Some("The vault is a directory of encrypted files. Back it up as a unit."),
+        AppState::ROW_VAULT => Some("Enter a new vault directory. DOMI_VAULT_DIR overrides it."),
         AppState::ROW_KDF => Some("Higher cost means a slower unlock and a stronger key."),
         AppState::ROW_AUTO_LOCK => Some("Left and right change the delay. 0 turns auto-lock off."),
         AppState::ROW_MASTER_PASSWORD => {

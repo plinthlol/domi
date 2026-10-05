@@ -55,20 +55,46 @@ impl VaultPaths {
     /// The platform-appropriate default location.
     ///
     /// `DOMI_VAULT_DIR` overrides it, which lets a user point the TUI at a
-    /// specific vault.
+    /// specific vault. The config file's `vault-dir` is consulted after the
+    /// environment variable and before the platform default, so a setting made
+    /// in the app survives a restart while an explicit `DOMI_VAULT_DIR` still
+    /// wins for the run it was set in.
+    ///
+    /// A config file that fails to parse is reported as a status message rather
+    /// than propagated: the user gets told their settings were ignored and the
+    /// app still opens on the default vault, which is far better than refusing
+    /// to start over a stray typo in a preferences file.
     pub fn default_location() -> Self {
-        Self::default_location_from(std::env::var("DOMI_VAULT_DIR").ok())
+        let env_dir = std::env::var("DOMI_VAULT_DIR").ok();
+        if let Some(paths) = Self::from_env(env_dir.clone()) {
+            return paths;
+        }
+        match crate::config::Config::load() {
+            Ok(cfg) => {
+                if let Some(dir) = cfg.vault_dir() {
+                    return Self::new(dir);
+                }
+                Self::default_platform_location()
+            }
+            // Surfaced to the user by `main`, which has no status line yet at
+            // this point, so the message goes to stderr there instead.
+            Err(e) => {
+                eprintln!("{}: ignoring unreadable config: {e}", crate::bin_name());
+                Self::default_platform_location()
+            }
+        }
     }
 
-    /// The same lookup, with the override supplied directly.
+    /// The location implied by `DOMI_VAULT_DIR` alone, if it is set.
     ///
-    /// The env var is process-global, so tests pass the value as an argument
-    /// instead of calling `set_var` — otherwise two tests touching it on
-    /// parallel threads race and intermittently clobber each other.
-    fn default_location_from(override_dir: Option<String>) -> Self {
-        if let Some(custom) = override_dir.filter(|c| !c.is_empty()) {
-            return VaultPaths::new(custom);
-        }
+    /// Split out so the precedence order in [`VaultPaths::default_location`]
+    /// reads top to bottom without a nested conditional.
+    fn from_env(override_dir: Option<String>) -> Option<Self> {
+        override_dir.filter(|c| !c.is_empty()).map(Self::new)
+    }
+
+    /// The platform default, ignoring both the env var and the config file.
+    fn default_platform_location() -> Self {
         let base = directories::ProjectDirs::from("", "", "domi")
             .map(|d| d.data_dir().to_path_buf())
             .unwrap_or_else(|| {
@@ -433,6 +459,35 @@ mod tests {
     use crate::vault_store::testing::TempVault;
 
     #[test]
+    fn the_env_var_wins_over_everything_else() {
+        // `from_env` is the env-only slice of the precedence chain, so this
+        // pins the rule that an explicit export is never overridden by a file.
+        let paths = VaultPaths::from_env(Some("/tmp/from-env".into())).expect("env is set");
+        assert_eq!(paths.root(), Path::new("/tmp/from-env"));
+    }
+
+    #[test]
+    fn an_empty_env_var_is_ignored_so_the_chain_continues() {
+        // An exported-but-empty variable must not resolve the vault to "".
+        assert!(VaultPaths::from_env(Some(String::new())).is_none());
+        assert!(VaultPaths::from_env(None).is_none());
+    }
+
+    #[test]
+    fn the_platform_default_is_a_vault_subdirectory_of_the_data_dir() {
+        let paths = VaultPaths::default_platform_location();
+        assert!(
+            paths.root().ends_with("vault"),
+            "the default should be the vault dir: {}",
+            paths.root().display()
+        );
+        assert!(
+            !paths.root().as_os_str().is_empty(),
+            "the default must not be an empty path"
+        );
+    }
+
+    #[test]
     fn create_then_unlock_roundtrips() {
         let t = TempVault::new();
         let paths = t.paths();
@@ -611,20 +666,22 @@ mod tests {
     #[test]
     fn default_location_honours_the_env_override() {
         // Lets a user point the TUI at a specific vault for testing.
-        let p = VaultPaths::default_location_from(Some("/tmp/domi-override-check".into()));
+        let p = VaultPaths::from_env(Some("/tmp/domi-override-check".into())).unwrap();
         assert_eq!(p.root(), Path::new("/tmp/domi-override-check"));
     }
 
     #[test]
     fn an_empty_override_falls_back_to_the_platform_default() {
-        let empty = VaultPaths::default_location_from(Some(String::new()));
-        let none = VaultPaths::default_location_from(None);
-        assert_eq!(empty.root(), none.root());
+        // The env slice yields nothing, so the chain continues to the platform
+        // default rather than resolving to an empty path.
+        assert!(VaultPaths::from_env(Some(String::new())).is_none());
+        assert!(VaultPaths::from_env(None).is_none());
+        assert!(!VaultPaths::default_platform_location().root().as_os_str().is_empty());
     }
 
     #[test]
     fn default_location_is_absolute_and_mentions_domi() {
-        let p = VaultPaths::default_location_from(None);
+        let p = VaultPaths::default_platform_location();
         let s = p.root().to_string_lossy().to_string();
         assert!(s.contains("domi"), "default path should be Domi-scoped: {s}");
     }

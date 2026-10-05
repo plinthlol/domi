@@ -223,6 +223,10 @@ fn adjust_setting(state: &mut AppState, delta: i64) -> Action {
 /// What `enter` does on the highlighted settings row.
 fn apply_setting(state: &mut AppState) -> Action {
     match state.settings_row {
+        AppState::ROW_VAULT => {
+            state.begin_vault_dir_change();
+            Action::Redraw
+        }
         AppState::ROW_MASTER_PASSWORD => {
             state.begin_master_password_change();
             Action::Redraw
@@ -315,21 +319,17 @@ fn handle_modal_key(
             C::Enter => Action::SaveForm, // the caller interprets this per-modal
             _ => Action::None,
         },
-        Modal::Password { .. } => match code {
+        Modal::Password { .. } | Modal::Text { .. } => match code {
             C::Enter => Action::SaveForm,
             C::Backspace => {
-                if let Some(Modal::Password { value, .. }) =
-                    state.modal.as_mut()
-                {
-                    value.pop();
+                if let Some(m) = state.modal.as_mut() {
+                    m.pop_char();
                 }
                 Action::Redraw
             }
             C::Char(c) => {
-                if let Some(Modal::Password { value, .. }) =
-                    state.modal.as_mut()
-                {
-                    value.push(c);
+                if let Some(m) = state.modal.as_mut() {
+                    m.push_char(c);
                 }
                 Action::Redraw
             }
